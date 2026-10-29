@@ -32,7 +32,8 @@ WelcomeLabel2=This installs the NHL Hitz Pro PC recompilation.%n%nThe game's own
 
 [Files]
 Source: "{#BuildDir}\nhl_hitz_pro_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BuildDir}\nhl_import.exe"; DestDir: "{app}"; Flags: ignoreversion
+; the import tool only runs during setup; it is not installed
+Source: "{#BuildDir}\nhl_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 
 [Icons]
 Name: "{autoprograms}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
@@ -118,7 +119,7 @@ begin
   begin
     WizardForm.StatusLabel.Caption := 'Copying the game files from your disc (about 1.5 GB, a few minutes)...';
     WizardForm.FilenameLabel.Caption := '';
-    if not Exec(ExpandConstant('{app}\nhl_import.exe'),
+    if not Exec(ExpandConstant('{tmp}\nhl_import.exe'),
         '"' + Trim(SrcEdit.Text) + '" "' + ExpandConstant('{app}\game_files') + '"',
         '', SW_HIDE, ewWaitUntilTerminated, Code) then
       Code := 99;
