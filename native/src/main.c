@@ -540,19 +540,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * stall once blamed on the keyboard was the boot hang, which happened
      * without it too and is fixed by RECOMP_XPP_WAIT_FIX. */
     if (!getenv("RECOMP_USB")) _putenv_s("RECOMP_USB", "1");
-    /* One emulated pad per connected XInput controller (up to 4, at least 1): the game
-     * is a 4-player game, and a pad plugged into the console is a pad the game sees.
-     * The highest connected slot decides, so controller N stays player N. Pads plugged
-     * in after start-up are not picked up. */
-    if (!getenv("RECOMP_USB_PADS")) {
-        extern DWORD WINAPI XInputGetState(DWORD user, void *state);   /* XINPUT_STATE is 16 bytes */
-        unsigned char st[32];
-        int n = 1, i;
-        for (i = 0; i < 4; i++)
-            if (XInputGetState((DWORD)i, st) == ERROR_SUCCESS)
-                n = i + 1;
-        _putenv_s("RECOMP_USB_PADS", n == 1 ? "1" : n == 2 ? "2" : n == 3 ? "3" : "4");
-    }
+    /* Controllers plug in and out while the game runs: pad 0 is always there (the keyboard
+     * drives it) and pads 1-3 follow the connected XInput controllers, controller N being
+     * player N (native/overrides/ohci.c). RECOMP_USB_PADS=n instead plugs in a fixed n. */
+    if (!getenv("RECOMP_USB_PADS") && !getenv("RECOMP_USB_HOTPLUG")) _putenv_s("RECOMP_USB_HOTPLUG", "1");
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");

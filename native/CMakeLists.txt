@@ -68,6 +68,11 @@ get_target_property(apu_sources xbox_apu SOURCES)
 list(REMOVE_ITEM apu_sources apu_vp.c apu_xaudio2.c)
 set_property(TARGET xbox_apu PROPERTY SOURCES "${apu_sources}")
 target_sources(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/apu_vp.c")
+# Project-local copies of ohci.c and usb_gamepad.c: controllers plug in and out while the game runs (hot-plug).
+get_target_property(usb_sources xbox_usb SOURCES)
+list(REMOVE_ITEM usb_sources ohci.c usb_gamepad.c)
+set_property(TARGET xbox_usb PROPERTY SOURCES "${usb_sources}")
+target_sources(xbox_usb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/ohci.c" "${CMAKE_CURRENT_SOURCE_DIR}/overrides/usb_gamepad.c")
 # Project-local copy of host_time.c: a pausable host clock and a timer thread that holds while paused.
 get_target_property(host_time_sources host_time SOURCES)
 list(REMOVE_ITEM host_time_sources host_time.c)
