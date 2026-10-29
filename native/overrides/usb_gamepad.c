@@ -564,7 +564,23 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+static int usb_gamepad_report_real(int pad, uint8_t *out, int max);
+
+/* PROJECT OVERRIDE (NHL Hitz Pro): while the quit prompt or settings menu is open every pad reports
+ * nothing pressed, so the game cannot be steered (or a press queued) from behind the overlay. */
+volatile int nhl_input_block;
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
+{
+    if (nhl_input_block && max >= 20) {
+        memset(out, 0, 20);
+        out[1] = 20;
+        return 20;
+    }
+    return usb_gamepad_report_real(pad, out, max);
+}
+
+static int usb_gamepad_report_real(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;

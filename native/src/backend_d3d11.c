@@ -181,6 +181,9 @@ static int s_scale = 1;           /* internal resolution: 1..5 x the Xbox's 640x
 static int s_scale_applied = 1;   /* the scale the render targets in g.rt were made at */
 static int s_aniso = 1;           /* anisotropic filtering: 1 (off), 2, 4, 8, 16 */
 static int s_set_active, s_set_sel, s_set_armed;
+extern volatile int nhl_input_block;           /* usb_gamepad.c override: the game sees neutral pads */
+static int s_pad_valid, s_unblock_wait;   /* controller 1 driving the overlay / waiting for its buttons to be released */
+static DWORD s_unblock_t;
 static RECT s_set_row[8];
 static int s_ztex_flush;          /* zeta_as_texture: drop its cached copies */
 static void rt_reset_all(void);
@@ -393,7 +396,7 @@ static void set_draw(void)
     {
         HFONT fh = CreateFontA(-(rh * 38 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Bahnschrift SemiCondensed");
         HGDIOBJ prev = SelectObject(mdc, fh);
-        DrawTextA(mdc, "Up/Down choose, Left/Right change. Saved automatically. F1 or Esc closes.", -1, &rr, DT_LEFT | DT_WORDBREAK);
+        DrawTextA(mdc, "Up/Down choose, Left/Right change, Enter or A confirms. Saved automatically. F1, Esc or B closes.", -1, &rr, DT_LEFT | DT_WORDBREAK);
         SelectObject(mdc, prev);
         DeleteObject(fh);
     }
@@ -449,18 +452,6 @@ static int set_key(WPARAM w, LPARAM l, int down)
     return 1;
 }
 
-static LRESULT set_mouse(UINT m, LPARAM l)
-{
-    POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
-    int i;
-    for (i = 0; i < SET_ITEMS; i++)
-        if (PtInRect(&s_set_row[i], pt)) {
-            if (m == WM_MOUSEMOVE) { if (s_set_sel != i) { s_set_sel = i; s_set_armed = 0; set_draw(); } }
-            else { s_set_sel = i; set_change(i, set_count(i) ? +1 : 0); }
-            break;
-        }
-    return 0;
-}
 
 static void quit_draw(void);
 static void quit_close(void);
@@ -470,24 +461,9 @@ extern void xa2_set_muted(int muted);      /* apu_xaudio2.c override */
 
 static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (s_set_active && (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN))
-        return set_mouse(m, l);
-    switch (m) {
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_MOUSEMOVE: {
-        POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
-        int i;
-        for (i = 0; i < 2; i++)
-            if (PtInRect(&s_q_btn[i], pt) && s_q_sel != i) { s_q_sel = i; quit_draw(); }
-        return 0;
-    }
-    case WM_LBUTTONDOWN: {
-        POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
-        if (PtInRect(&s_q_btn[1], pt)) TerminateProcess(GetCurrentProcess(), 0);
-        if (PtInRect(&s_q_btn[0], pt)) quit_close();
-        return 0;
-    }
-    }
+    /* The overlays are driven by the keyboard and controller 1 only: the window takes no mouse. */
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    if (m == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     return DefWindowProcA(h, m, w, l);
 }
 
@@ -578,11 +554,12 @@ static void quit_open(void)
         wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
         wc.lpszClassName = "NhlQuitOverlay";
         RegisterClassA(&wc);
-        s_q_hwnd = CreateWindowExA(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, wc.lpszClassName, "",
+        s_q_hwnd = CreateWindowExA(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT, wc.lpszClassName, "",
                                    WS_POPUP, 0, 0, 1, 1, g.hwnd, NULL, wc.hInstance, NULL);
         if (!s_q_hwnd) return;
     }
     xbox_InputKeysClear();            /* nothing the game saw as held stays held */
+    nhl_input_block = 1; s_unblock_wait = 0; s_pad_valid = 0;     /* the game sees neutral pads while this is up */
     s_q_sel = 0; s_q_active = 1;
     xbox_time_pause_begin();          /* the game's clocks stop; present() holds below */
     xa2_set_muted(1);
@@ -592,10 +569,64 @@ static void quit_open(void)
 
 static void quit_close(void)
 {
-    if (s_q_active) { xa2_set_muted(0); xbox_time_pause_end(); }
+    if (s_q_active) {
+        xa2_set_muted(0); xbox_time_pause_end();
+        s_unblock_wait = 1; s_unblock_t = GetTickCount();         /* neutral until the buttons are released */
+    }
     s_q_active = 0;
     s_set_active = 0; s_set_armed = 0;
     if (s_q_hwnd) ShowWindow(s_q_hwnd, SW_HIDE);
+}
+
+/* Controller 1 (XInput slot 0) moves through the overlays like the keyboard: D-pad or left stick
+ * to choose and change, A to confirm, B or Start to close. Other controllers do nothing. */
+typedef struct { DWORD pkt; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } NhlPadState;
+extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+static WORD s_pad_prev;
+static DWORD s_pad_rep;
+
+static void pad_overlay_poll(void)
+{
+    NhlPadState st;
+    WORD b, press, dirs;
+    DWORD now = GetTickCount();
+    if (!s_q_active) return;
+    if (XInputGetState(0, &st) != 0) { s_pad_prev = 0; s_pad_valid = 1; return; }
+    b = st.buttons;
+    if (st.lx < -16000) b |= 0x0004;
+    if (st.lx > 16000)  b |= 0x0008;
+    if (st.ly > 16000)  b |= 0x0001;
+    if (st.ly < -16000) b |= 0x0002;
+    if (!s_pad_valid) { s_pad_prev = b; s_pad_valid = 1; return; }   /* what was held when it opened is not a press */
+    press = (WORD)(b & ~s_pad_prev);
+    dirs = (WORD)(b & 0x000F);
+    if (press & 0x1000) quit_key(VK_RETURN, 0, 1);                /* A */
+    if (press & 0x2000) quit_key(VK_ESCAPE, 0, 1);                /* B */
+    else if (press & 0x0010) quit_key(VK_ESCAPE, 0, 1);           /* Start */
+    if (s_q_active) {
+        WORD fire = 0;
+        if (press & 0x000F) { fire = (WORD)(press & 0x000F); s_pad_rep = now + 350; }
+        else if (dirs && now >= s_pad_rep) { fire = dirs; s_pad_rep = now + 110; }   /* held: repeat */
+        if (fire & 0x0001) quit_key(VK_UP, 0, 1);
+        else if (fire & 0x0002) quit_key(VK_DOWN, 0, 1);
+        else if (fire & 0x0004) quit_key(VK_LEFT, 0, 1);
+        else if (fire & 0x0008) quit_key(VK_RIGHT, 0, 1);
+    }
+    s_pad_prev = b;
+}
+
+/* After an overlay closes, the game keeps seeing neutral pads until the buttons are let go, so the
+ * press that closed it is not also a press in the game. */
+static void pad_unblock_tick(void)
+{
+    NhlPadState st;
+    if (!s_unblock_wait) return;
+    if (XInputGetState(0, &st) != 0 || (st.buttons == 0 && st.lx > -16000 && st.lx < 16000 &&
+                                        st.ly > -16000 && st.ly < 16000) ||
+        GetTickCount() - s_unblock_t > 2000) {
+        nhl_input_block = 0;
+        s_unblock_wait = 0;
+    }
 }
 
 static void set_open(void)
@@ -687,7 +718,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         xbox_InputKeySet((int)w, 0);
         return 0;
     case WM_SETCURSOR:              /* borderless fullscreen: no mouse pointer over the game */
-        if (s_fs && !s_q_active && LOWORD(l) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        if (s_fs && LOWORD(l) == HTCLIENT) { SetCursor(NULL); return TRUE; }
         break;
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
@@ -3280,7 +3311,8 @@ static void be_flip(void)
     pump_messages();
     quit_tick();
     /* Paused: the flip does not return, so the game stops here until the overlay closes. */
-    while (s_q_active) { Sleep(8); pump_messages(); quit_tick(); }
+    pad_unblock_tick();
+    while (s_q_active) { Sleep(8); pump_messages(); quit_tick(); pad_overlay_poll(); }
     if (g.log && (g.flips % 300) == 0)
         logf_("flips=%u t=%.1fs rcdraws=%u specs=%u specfail=%u spec_ms=%llu draws=%u tris=%u textures=%d decodes=%llu uploads=%llu decode_ms=%llu hash_ms=%llu\n",
               g.flips, (GetTickCount() - g.t0) / 1000.0, g.rc_draws, s_nspec, s_spec_fail, (unsigned long long)s_spec_ms, g.draws, g.tris, s_ntex,
