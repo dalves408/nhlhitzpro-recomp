@@ -36,6 +36,8 @@ Esc pauses the game (clocks, timers and sound stop) and asks "Do you want to qui
 
 XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
 
+**Changing the keyboard keys:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu). Pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
+
 **Known issues**
 
 - The first time through a new part of the game, a short stutter can appear while shaders are built. It does not return once they are cached.
@@ -84,6 +86,7 @@ The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup). `nativ
 | `scripts/` | Pipeline driver and lift-time hooks |
 | `native/` | CMake project, startup code, the D3D11 back end, project overrides of toolkit files (`native/overrides/`) |
 | `native/installer/` | Disc import tool and installer script |
+| `native/config/` | `config.exe`, the settings program (keyboard remapper) |
 | `tools/xboxrecomp/` | The toolkit, a git submodule pinned to the tested commit |
 
 ## Credits and legal
