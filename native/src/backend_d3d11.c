@@ -51,7 +51,11 @@ typedef struct {
     ID3D11Texture2D        *dtex;    /* depth/stencil, created on first use */
     ID3D11DepthStencilView *dsv;
     ID3D11ShaderResourceView *srv;   /* when sampled as a texture */
+    ID3D11Texture2D        *mtex;    /* F1 anti-aliasing: the multisampled surface that is drawn to; */
+    ID3D11RenderTargetView *mrtv;    /*   tex above is its resolved, single-sample copy */
+    uint8_t ms, dirty;               /* drawn with MSAA / drawn to since the last resolve */
 } RenderTarget;
+static void rt_resolve(RenderTarget *r);
 
 /* Small cache of D3D11 state objects keyed by a memcmp-able struct. */
 #define MAX_STATES 256
@@ -177,11 +181,33 @@ static int s_scale = 1;           /* internal resolution: 1..5 x the Xbox's 640x
 static int s_scale_applied = 1;   /* the scale the render targets in g.rt were made at */
 static int s_aniso = 1;           /* anisotropic filtering: 1 (off), 2, 4, 8, 16 */
 static int s_set_active, s_set_sel, s_set_armed;
-static RECT s_set_row[6];
+static RECT s_set_row[8];
 static int s_ztex_flush;          /* zeta_as_texture: drop its cached copies */
 static void rt_reset_all(void);
+static int s_msaa = 1;            /* F1 anti-aliasing: 1 (off), 2, 4, 8 samples */
+static int s_msaa_applied = 1;
+static int s_stretch;             /* F1 "Stretch image": fill the window instead of the 4:3 shape */
 
-#define SET_ITEMS 6
+/* The most samples (up to the chosen number) the card supports for both the colour and depth formats. */
+static int msaa_effective(void)
+{
+    static int cache[9], done[9];
+    int want = s_msaa, n;
+    if (want <= 1 || !g.dev) return 1;
+    if (want > 8) want = 8;
+    if (done[want]) return cache[want];
+    for (n = want; n > 1; n >>= 1) {
+        UINT qc = 0, qd = 0;
+        ID3D11Device_CheckMultisampleQualityLevels(g.dev, DXGI_FORMAT_B8G8R8A8_UNORM, (UINT)n, &qc);
+        ID3D11Device_CheckMultisampleQualityLevels(g.dev, DXGI_FORMAT_D24_UNORM_S8_UINT, (UINT)n, &qd);
+        if (qc > 0 && qd > 0) break;
+    }
+    done[want] = 1; cache[want] = n < 1 ? 1 : n;
+    return cache[want];
+}
+
+#define SET_ITEMS 8
+enum { IT_RES, IT_FS, IT_STRETCH, IT_VSYNC, IT_AA, IT_ANISO, IT_CLOSE, IT_QUIT };
 
 static int cfg_path(char *out, size_t n)
 {
@@ -217,6 +243,10 @@ static void settings_load(void)
     s_scale = clampi(cfg_get("resolution_scale", 1), 1, 5);
     if (e && *e) s_scale = clampi(atoi(e), 1, 5);
     s_scale_applied = s_scale;
+    a = cfg_get("msaa", 1);
+    s_msaa = a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
+    s_msaa_applied = s_msaa;
+    s_stretch = cfg_get("stretch", 0) != 0;
     a = cfg_get("anisotropy", 1);
     s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
     if (!getenv("RECOMP_D3D11_VSYNC"))
@@ -224,22 +254,34 @@ static void settings_load(void)
 }
 
 static const char *const SET_LABEL[SET_ITEMS] = {
-    "Resolution", "Fullscreen", "VSync", "Anisotropic filter", "Close menu", "Quit game" };
+    "Resolution", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
 static const char *const SET_RES[5] = {
     "1x  640x480 (Xbox)", "2x  1280x960 (1080p)", "3x  1920x1440 (2K)",
     "4x  2560x1920", "5x  3200x2400 (4K)" };
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
+static const char *const SET_STRETCH[2] = { "Off (4:3)", "On (fills window)" };
+static const char *const SET_AA[4] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
 
-static int set_count(int i) { return i == 0 ? 5 : i == 3 ? 5 : i <= 2 ? 2 : 0; }
+static int set_count(int i)
+{
+    switch (i) {
+    case IT_RES: case IT_ANISO: return 5;
+    case IT_AA: return 4;
+    case IT_FS: case IT_STRETCH: case IT_VSYNC: return 2;
+    }
+    return 0;
+}
 
 static int set_get(int i)
 {
     switch (i) {
-    case 0: return s_scale - 1;
-    case 1: return s_fs ? 1 : 0;
-    case 2: return g.vsync ? 1 : 0;
-    case 3: return s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : s_aniso >= 2 ? 1 : 0;
+    case IT_RES: return s_scale - 1;
+    case IT_FS: return s_fs ? 1 : 0;
+    case IT_STRETCH: return s_stretch ? 1 : 0;
+    case IT_VSYNC: return g.vsync ? 1 : 0;
+    case IT_AA: return s_msaa >= 8 ? 3 : s_msaa >= 4 ? 2 : s_msaa >= 2 ? 1 : 0;
+    case IT_ANISO: return s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : s_aniso >= 2 ? 1 : 0;
     }
     return 0;
 }
@@ -248,20 +290,29 @@ static const char *set_text(int i)
 {
     int v = set_get(i);
     switch (i) {
-    case 0: return SET_RES[v];
-    case 3: return SET_ANISO[v];
-    case 1: case 2: return SET_OFFON[v];
+    case IT_RES: return SET_RES[v];
+    case IT_STRETCH: return SET_STRETCH[v];
+    case IT_AA: return SET_AA[v];
+    case IT_ANISO: return SET_ANISO[v];
+    case IT_FS: case IT_VSYNC: return SET_OFFON[v];
     }
     return "";
 }
 
+static void aspect_on_size(void);
+
 static void set_put(int i, int v)
 {
     switch (i) {
-    case 0: s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;   /* applied by the next draw */
-    case 1: user_toggle_fullscreen(g.hwnd); break;
-    case 2: g.vsync = v; cfg_put("vsync", v); break;
-    case 3: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
+    case IT_RES: s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;   /* applied by the next draw */
+    case IT_FS: user_toggle_fullscreen(g.hwnd); break;
+    case IT_STRETCH:
+        s_stretch = v; cfg_put("stretch", v);
+        if (!s_stretch && !s_fs) aspect_on_size();      /* back to the 4:3 window shape */
+        break;
+    case IT_VSYNC: g.vsync = v; cfg_put("vsync", v); break;
+    case IT_AA: s_msaa = v ? 1 << v : 1; cfg_put("msaa", s_msaa); break;       /* applied by the next draw */
+    case IT_ANISO: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
     }
 }
 
@@ -302,7 +353,7 @@ static void set_draw(void)
     rh = ch * 7 / 100; if (rh < 22) rh = 22;
     dw = rh * 17;
     if (dw > cw * 95 / 100) { dw = cw * 95 / 100; rh = dw / 17; }
-    dh = rh * 93 / 10;
+    dh = rh * 113 / 10;
     dx = (cw - dw) / 2; dy = (ch - dh) / 2;
     SetRect(&rr, dx, dy, dx + dw, dy + dh);
     br = CreateSolidBrush(RGB(255, 122, 0)); FillRect(mdc, &rr, br); DeleteObject(br);
@@ -331,7 +382,7 @@ static void set_draw(void)
         rr = s_set_row[i]; rr.right -= rh / 3;
         if (set_count(i))
             snprintf(buf, sizeof buf, "<  %s  >", set_text(i));
-        else if (i == 5 && s_set_armed)
+        else if (i == IT_QUIT && s_set_armed)
             snprintf(buf, sizeof buf, "press again to quit");
         else
             buf[0] = 0;
@@ -369,12 +420,12 @@ static void set_change(int i, int dir)
     int n = set_count(i);
     if (n) {
         int v = (set_get(i) + dir + n) % n;
-        if (i == 1) v = !s_fs;
+        if (i == IT_FS) v = !s_fs;
         set_put(i, v);
         s_set_armed = 0;
     } else if (dir == 0) {
-        if (i == 4) quit_close();
-        else if (i == 5) {
+        if (i == IT_CLOSE) quit_close();
+        else if (i == IT_QUIT) {
             if (s_set_armed) TerminateProcess(GetCurrentProcess(), 0);
             s_set_armed = 1;
         }
@@ -782,6 +833,8 @@ static RenderTarget *get_rt(const Nv2aSurface *s)
         int worst = 0;
         for (i = 1; i < g.nrt; i++) if (g.rt[i].uses < g.rt[worst].uses) worst = i;
         ID3D11RenderTargetView_Release(g.rt[worst].rtv);
+        if (g.rt[worst].mrtv) ID3D11RenderTargetView_Release(g.rt[worst].mrtv);
+        if (g.rt[worst].mtex) ID3D11Texture2D_Release(g.rt[worst].mtex);
         ID3D11Texture2D_Release(g.rt[worst].tex);
         if (g.rt[worst].srv) ID3D11ShaderResourceView_Release(g.rt[worst].srv);
         if (g.rt[worst].dsv) ID3D11DepthStencilView_Release(g.rt[worst].dsv);
@@ -802,6 +855,18 @@ static RenderTarget *get_rt(const Nv2aSurface *s)
     hr = ID3D11Device_CreateTexture2D(g.dev, &td, NULL, &r->tex);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateRenderTargetView(g.dev, (ID3D11Resource *)r->tex, NULL, &r->rtv);
+    if (SUCCEEDED(hr) && msaa_effective() > 1) {      /* the surface the game draws to */
+        D3D11_TEXTURE2D_DESC md = td;
+        md.SampleDesc.Count = (UINT)msaa_effective();
+        md.BindFlags = D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(ID3D11Device_CreateTexture2D(g.dev, &md, NULL, &r->mtex)) &&
+            SUCCEEDED(ID3D11Device_CreateRenderTargetView(g.dev, (ID3D11Resource *)r->mtex, NULL, &r->mrtv))) {
+            r->ms = (uint8_t)msaa_effective();
+        } else {
+            if (r->mtex) ID3D11Texture2D_Release(r->mtex);
+            r->mtex = NULL; r->mrtv = NULL; r->ms = 0;
+        }
+    }
     if (FAILED(hr)) {
         logf_("render target %ux%u failed 0x%08lX\n", s->width, s->height, (unsigned long)hr);
         if (r->tex) ID3D11Texture2D_Release(r->tex);
@@ -1734,23 +1799,35 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aTexture *t, RenderTarge
                 FAILED(ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)g.rt[i].tex,
                                                              NULL, &g.rt[i].srv)))
                 return NULL;
+            rt_resolve(&g.rt[i]);
             *out = &g.rt[i];
             return g.rt[i].srv;
         }
     return NULL;
 }
 
-static struct { uint32_t va, w, h; ID3D11Texture2D *dtex; ID3D11DepthStencilView *dsv; } zpool[8];
+static struct { uint32_t va, w, h; ID3D11Texture2D *dtex; ID3D11DepthStencilView *dsv; uint8_t ms; } zpool[8];
 static int zpool_n, zpool_want;
 static RenderTarget *s_asp_last;
 
 /* The internal resolution changed: drop every render surface (and the depth buffers they
  * share); the next draw makes them again at the new scale. */
+static void rt_resolve(RenderTarget *r)
+{
+    if (r && r->ms && r->dirty) {
+        ID3D11DeviceContext_ResolveSubresource(g.ctx, (ID3D11Resource *)r->tex, 0,
+                                               (ID3D11Resource *)r->mtex, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+        r->dirty = 0;
+    }
+}
+
 static void rt_reset_all(void)
 {
     int i;
     for (i = 0; i < g.nrt; i++) {
         if (g.rt[i].rtv) ID3D11RenderTargetView_Release(g.rt[i].rtv);
+        if (g.rt[i].mrtv) ID3D11RenderTargetView_Release(g.rt[i].mrtv);
+        if (g.rt[i].mtex) ID3D11Texture2D_Release(g.rt[i].mtex);
         if (g.rt[i].tex) ID3D11Texture2D_Release(g.rt[i].tex);
         if (g.rt[i].srv) ID3D11ShaderResourceView_Release(g.rt[i].srv);
         if (g.rt[i].dsv) ID3D11DepthStencilView_Release(g.rt[i].dsv);
@@ -1765,6 +1842,7 @@ static void rt_reset_all(void)
     s_asp_last = NULL;
     s_ztex_flush = 1;
     s_scale_applied = s_scale;
+    s_msaa_applied = s_msaa;
     logf_("internal resolution %dx (%dx%d)\n", s_scale, 640 * s_scale, 480 * s_scale);
 }
 
@@ -1809,6 +1887,21 @@ static const char k_hlsl_ztex[] =
 
 static int s_ztex_flush;
 
+/* The same pass for a multisampled depth buffer: sample 0 of each pixel. */
+static const char k_hlsl_ztex_ms[] =
+"Texture2DMS<float> zd : register(t0);\n"
+"Texture2DMS<uint2> zs : register(t1);\n"
+"float4 vs_z(uint id : SV_VertexID) : SV_Position {\n"
+"  float2 p = float2((id << 1) & 2, id & 2);\n"
+"  return float4(p * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
+"float4 zbytes(float4 pos) {\n"
+"  int2 q = int2(pos.xy);\n"
+"  uint z = (uint)(saturate(zd.Load(q, 0)) * 16777215.0 + 0.5);\n"
+"  uint s = zs.Load(q, 0).g;\n"
+"  return float4(s, z & 255u, (z >> 8) & 255u, z >> 16) / 255.0; }\n"
+"float4 ps_z_abgr(float4 pos : SV_Position) : SV_Target { return zbytes(pos); }\n"
+"float4 ps_z_argb(float4 pos : SV_Position) : SV_Target { float4 b = zbytes(pos); return float4(b.b, b.g, b.r, b.a); }\n";
+
 static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
 {
     static ID3D11VertexShader *vs;
@@ -1836,6 +1929,9 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
         }
         nzc = 0;
         s_ztex_flush = 0;
+        if (vs) { ID3D11VertexShader_Release(vs); vs = NULL; }          /* recompiled for the new sample count */
+        if (ps[0]) { ID3D11PixelShader_Release(ps[0]); ps[0] = NULL; }
+        if (ps[1]) { ID3D11PixelShader_Release(ps[1]); ps[1] = NULL; }
     }
     if (!ztex_enabled() || init_failed) return NULL;
     if (t->color != 0x3F && t->color != 0x12) return NULL;   /* LIN_A8B8G8R8, LIN_A8R8G8B8 */
@@ -1847,9 +1943,15 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
     if (!zr) return NULL;
     argb = t->color == 0x12;
     if (!vs) {
-        ID3DBlob *b0 = compile_hlsl_src(k_hlsl_ztex, sizeof k_hlsl_ztex - 1, "vs_z", "vs_4_0");
-        ID3DBlob *b1 = compile_hlsl_src(k_hlsl_ztex, sizeof k_hlsl_ztex - 1, "ps_z_abgr", "ps_4_0");
-        ID3DBlob *b2 = compile_hlsl_src(k_hlsl_ztex, sizeof k_hlsl_ztex - 1, "ps_z_argb", "ps_4_0");
+        const char *zsrc = zr->ms ? k_hlsl_ztex_ms : k_hlsl_ztex;
+        size_t zlen = zr->ms ? sizeof k_hlsl_ztex_ms - 1 : sizeof k_hlsl_ztex - 1;
+        const char *zprof = zr->ms ? "4_1" : "4_0";
+        char tv[8], tp[8];
+        ID3DBlob *b0, *b1, *b2;
+        snprintf(tv, sizeof tv, "vs_%s", zprof); snprintf(tp, sizeof tp, "ps_%s", zprof);
+        b0 = compile_hlsl_src(zsrc, zlen, "vs_z", tv);
+        b1 = compile_hlsl_src(zsrc, zlen, "ps_z_abgr", tp);
+        b2 = compile_hlsl_src(zsrc, zlen, "ps_z_argb", tp);
         if (b0 && b1 && b2 &&
             SUCCEEDED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(b0), ID3D10Blob_GetBufferSize(b0), NULL, &vs)) &&
             SUCCEEDED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1), NULL, &ps[0])) &&
@@ -1871,7 +1973,7 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
         if (nzc >= 4) return NULL;
         memset(&zc[i], 0, sizeof zc[i]);
         memset(&sd, 0, sizeof sd);
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.ViewDimension = zr->ms ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
         sd.Texture2D.MipLevels = 1;
         sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
         if (FAILED(ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)zr->dtex, &sd, &zc[i].dsrv))) {
@@ -1941,6 +2043,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
 
     if (!rs || !rs->zeta_va) return;
     if (r->dsv && r->zeta_va == rs->zeta_va) return;
+    /* a multisampled colour surface needs a depth buffer with the same sample count */
     if (r->dsv) { ID3D11DepthStencilView_Release(r->dsv); r->dsv = NULL; }
     if (r->dtex) { ID3D11Texture2D_Release(r->dtex); r->dtex = NULL; }
     /* RECOMP_D3D11_SHAREZ=1: the title has ONE zeta buffer that every pass (display buffer and
@@ -1952,7 +2055,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
         if (share) {
             int k;
             for (k = 0; k < zpool_n; k++)
-                if (zpool[k].va == rs->zeta_va && zpool[k].w == r->w && zpool[k].h == r->h) {
+                if (zpool[k].va == rs->zeta_va && zpool[k].w == r->w && zpool[k].h == r->h && zpool[k].ms == r->ms) {
                     r->dtex = zpool[k].dtex; r->dsv = zpool[k].dsv;
                     ID3D11Texture2D_AddRef(r->dtex); ID3D11DepthStencilView_AddRef(r->dsv);
                     r->zeta_va = rs->zeta_va;
@@ -1964,7 +2067,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
     memset(&td, 0, sizeof td);
     td.Width = r->w * (UINT)s_scale; td.Height = r->h * (UINT)s_scale; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    td.SampleDesc.Count = 1;
+    td.SampleDesc.Count = r->ms ? r->ms : 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (ztex_enabled()) {   /* typeless so zeta_as_texture can read it back */
@@ -1976,7 +2079,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
         D3D11_DEPTH_STENCIL_VIEW_DESC dd;
         memset(&dd, 0, sizeof dd);
         dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-        dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        dd.ViewDimension = r->ms ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
         hr = ID3D11Device_CreateDepthStencilView(g.dev, (ID3D11Resource *)r->dtex, &dd, &r->dsv);
     }
     if (FAILED(hr)) {
@@ -1987,7 +2090,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
     r->zeta_va = rs->zeta_va;
     if (zpool_want && zpool_n < 8) {
         zpool[zpool_n].va = rs->zeta_va; zpool[zpool_n].w = r->w; zpool[zpool_n].h = r->h;
-        zpool[zpool_n].dtex = r->dtex; zpool[zpool_n].dsv = r->dsv;
+        zpool[zpool_n].dtex = r->dtex; zpool[zpool_n].dsv = r->dsv; zpool[zpool_n].ms = r->ms;
         ID3D11Texture2D_AddRef(r->dtex); ID3D11DepthStencilView_AddRef(r->dsv);
         zpool_n++;
     }
@@ -2001,7 +2104,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     RenderTarget *r;
 
     if (!init_window_and_device()) return;
-    if (s_scale_applied != s_scale) rt_reset_all();
+    if (s_scale_applied != s_scale || s_msaa_applied != s_msaa) rt_reset_all();
     tex_flush_if_changed();
     r = get_rt(s);
     if (!r) return;
@@ -2016,7 +2119,8 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
         c[1] = ((argb >> 8) & 0xFF) / 255.0f;
         c[2] = (argb & 0xFF) / 255.0f;
         c[3] = ((argb >> 24) & 0xFF) / 255.0f;
-        ID3D11DeviceContext_ClearRenderTargetView(g.ctx, r->rtv, c);
+        ID3D11DeviceContext_ClearRenderTargetView(g.ctx, r->ms ? r->mrtv : r->rtv, c);
+        r->dirty = 1;
     }
     if ((flags & 3u) && rs && rs->zeta_va) {
         ensure_depth(r, rs);
@@ -2172,7 +2276,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             nhit++; return;
         }
     }
-    if (s_scale_applied != s_scale) rt_reset_all();
+    if (s_scale_applied != s_scale || s_msaa_applied != s_msaa) rt_reset_all();
     tex_flush_if_changed();
     r = get_rt(s);
     if (!r) return;
@@ -2306,7 +2410,8 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         bf[3] = a;
     }
 
-    rtv = r->rtv;
+    rtv = r->ms ? r->mrtv : r->rtv;
+    r->dirty = 1;
     {
         ID3D11ShaderResourceView *nos4[4] = { NULL, NULL, NULL, NULL };
         (void)nosrv;
@@ -2827,7 +2932,7 @@ static void user_toggle_fullscreen(HWND h)
  * bars; they appear only in F11 fullscreen, where the monitor's shape is fixed. */
 static int aspect_window(void)
 {
-    return aspect_on() && !s_fs;
+    return aspect_on() && !s_fs && !s_stretch;
 }
 
 /* Width and height the frame (borders, title bar) adds to the client area. */
@@ -3006,6 +3111,7 @@ static int present_aspect(RenderTarget *r)
         { r->srv = NULL; return 0; }
     vh = ch; vw = (ch * 4u + 1u) / 3u;                    /* largest 4:3 rectangle that fits */
     if (vw > cw) { vw = cw; vh = (cw * 3u + 2u) / 4u; }
+    if (s_stretch) { vw = cw; vh = ch; }                  /* F1 "Stretch image": fill the window */
     ID3D11DeviceContext_OMSetRenderTargets(g.ctx, 1, &s_asp_rtv, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(g.ctx, s_asp_rtv, black);
     ID3D11DeviceContext_OMSetBlendState(g.ctx, NULL, NULL, 0xFFFFFFFFu);
@@ -3055,7 +3161,8 @@ static void be_flip(void)
             best = r;
     }
     s_asp_last = NULL;
-    if (best && (aspect_on() || s_scale > 1) && !s_asp_fail) {
+    rt_resolve(best);
+    if (best && (aspect_on() || s_scale > 1 || s_stretch || msaa_effective() > 1) && !s_asp_fail) {
         s_asp_busy = 1;
         if (g.dump_prefix && g.dump_every && (g.flips % g.dump_every) == 0)
             dump_tex(best->tex, NULL, 0);                 /* the game image, as without the switch */
@@ -3241,6 +3348,7 @@ static void be_blit(uint32_t src_va, uint32_t dst_va, uint32_t w, uint32_t h)
     for (i = 0; i < g.nrt; i++)
         if (g.rt[i].va == src_va && g.rt[i].w == w && g.rt[i].h == h) { s = &g.rt[i]; break; }
     if (!s) return;
+    rt_resolve(s);
     ID3D11DeviceContext_CopyResource(g.ctx, (ID3D11Resource *)d->tex, (ID3D11Resource *)s->tex);
     d->uses = 1;    /* keep it out of the eviction of unused entries */
     logf_("blit 0x%08X -> 0x%08X %ux%u flip %u\n", src_va, dst_va, w, h, g.flips);
