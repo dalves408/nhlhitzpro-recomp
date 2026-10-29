@@ -1412,10 +1412,29 @@ typedef struct {
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
     uint32_t last_use;
+    uint8_t mips;                    /* made with a mip chain (anisotropic filtering on) */
 } TexEntry;
 
 static TexEntry s_tex[MAX_TEX];
 static int s_ntex;
+
+/* The F1 anisotropic filter needs mip levels to work from: with it on, guest textures are
+ * made with a full mip chain (built on the GPU from level 0 after each upload); with it off
+ * they stay single-level, exactly as before. A change of the setting remakes the cache. */
+static int s_tex_mips;
+static int tex_want_mips(void) { return s_aniso > 1; }
+static void tex_flush_if_changed(void)
+{
+    int i;
+    if (s_tex_mips == tex_want_mips()) return;
+    for (i = 0; i < s_ntex; i++) {
+        if (s_tex[i].srv) ID3D11ShaderResourceView_Release(s_tex[i].srv);
+        if (s_tex[i].tex) ID3D11Texture2D_Release(s_tex[i].tex);
+    }
+    memset(s_tex, 0, sizeof s_tex[0] * (size_t)s_ntex);
+    s_ntex = 0;
+    s_tex_mips = tex_want_mips();
+}
 static uint32_t *s_scratch;
 static size_t s_scratch_cap;
 static StateCache s_samp;
@@ -1606,9 +1625,26 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = s_scratch; sd.SysMemPitch = t->width * 4; sd.SysMemSlicePitch = 0;
-        hr = ID3D11Device_CreateTexture2D(g.dev, &td, &sd, &e->tex);
-        if (SUCCEEDED(hr))
-            hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        if (tex_want_mips() && t->width >= 4 && t->height >= 4) {
+            td.MipLevels = 0;                                    /* the full chain */
+            td.BindFlags |= D3D11_BIND_RENDER_TARGET;            /* GenerateMips needs it */
+            td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            hr = ID3D11Device_CreateTexture2D(g.dev, &td, NULL, &e->tex);
+            if (SUCCEEDED(hr)) {
+                ID3D11DeviceContext_UpdateSubresource(g.ctx, (ID3D11Resource *)e->tex, 0, NULL,
+                                                      s_scratch, t->width * 4, 0);
+                hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+                if (SUCCEEDED(hr)) {
+                    ID3D11DeviceContext_GenerateMips(g.ctx, e->srv);
+                    e->mips = 1;
+                    { static int n; if (g.log && n++ < 3) logf_("mip chain built for %ux%u texture (aniso %dx)\n", t->width, t->height, s_aniso); }
+                }
+            }
+        } else {
+            hr = ID3D11Device_CreateTexture2D(g.dev, &td, &sd, &e->tex);
+            if (SUCCEEDED(hr))
+                hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
+        }
         if (FAILED(hr)) {
             logf_("texture %ux%u failed 0x%08lX\n", t->width, t->height, (unsigned long)hr);
             if (e->tex) ID3D11Texture2D_Release(e->tex);
@@ -1624,6 +1660,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     } else {
         ID3D11DeviceContext_UpdateSubresource(g.ctx, (ID3D11Resource *)e->tex, 0, NULL,
                                               s_scratch, t->width * 4, 0);
+        if (e->mips) ID3D11DeviceContext_GenerateMips(g.ctx, e->srv);
     }
     s_up_n++;
     e->hash = h;
@@ -1664,6 +1701,7 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
     d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     d.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(ID3D11Device_CreateSamplerState(g.dev, &d, &o))) { logf_("CreateSamplerState failed\n"); return NULL; }
+    if (g.log && d.Filter == D3D11_FILTER_ANISOTROPIC) { static int n; if (n++ < 2) logf_("anisotropic sampler %ux\n", d.MaxAnisotropy); }
     cache_put(&s_samp, key, sizeof key, o);
     return o;
 }
@@ -1964,6 +2002,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
 
     if (!init_window_and_device()) return;
     if (s_scale_applied != s_scale) rt_reset_all();
+    tex_flush_if_changed();
     r = get_rt(s);
     if (!r) return;
     r->uses++;
@@ -2134,6 +2173,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         }
     }
     if (s_scale_applied != s_scale) rt_reset_all();
+    tex_flush_if_changed();
     r = get_rt(s);
     if (!r) return;
     r->uses++;
