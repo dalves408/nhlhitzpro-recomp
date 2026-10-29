@@ -38,7 +38,9 @@ XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to 
 
 **Settings menu (F1):** pauses the game and lets you change the internal resolution (1x is the Xbox's 640x480; 2x is labelled 1080p, 3x 2K and 5x 4K, up to 3200x2400, by the height of the 4:3 picture; 4x sits in between), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
 
-**Changing the keyboard keys:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu). Pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
+**Settings program:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu) to set things before you start the game. Its **Video** tab, shown first, has the same options as the F1 menu (resolution, fullscreen, stretch image, VSync, anti-aliasing, anisotropic filter). Its **Controls** tab remaps the keyboard.
+
+**Changing the keyboard keys** (Controls tab): pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
 
 **Known issues**
 
