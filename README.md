@@ -16,9 +16,11 @@ This project contains **no game content**. You need your own copy of the Xbox di
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.2.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.3.exe` and choose where to install.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
 3. Start **NHL Hitz Pro** from the Start menu.
+
+If the game is already installed, Setup says so and shows the installed version and the new one. A different version only updates the program files after you confirm (no disc needed, game files and saves kept); the same version offers Repair or Quit.
 
 Saves and the shader cache are kept in `%LOCALAPPDATA%\NHLHitzPro`. Uninstalling removes the game files but leaves your saves.
 
