@@ -257,10 +257,10 @@ static void settings_load(void)
 }
 
 static const char *const SET_LABEL[SET_ITEMS] = {
-    "Resolution", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
+    "Render Scale", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
 static const char *const SET_RES[5] = {
-    "1x  640x480 (Xbox)", "2x  1280x960 (1080p)", "3x  1920x1440 (2K)",
-    "4x  2560x1920", "5x  3200x2400 (4K)" };
+    "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440",
+    "4x  2560x1920", "5x  3200x2400" };
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
 static const char *const SET_STRETCH[2] = { "Off (4:3)", "On (fills window)" };
@@ -3075,13 +3075,27 @@ static ID3D11SamplerState *s_asp_smp;
 static int s_asp_fail, s_asp_busy;
 static RenderTarget *s_asp_last;     /* the last presented game image (valid between flips) */
 
+/* The game image is drawn at the F1 resolution (up to 5x) and shown at whatever size the window is.
+ * Shrinking it with one bilinear tap throws most of those pixels away, so a high resolution would look
+ * no better than a low one (and shimmer). Instead each output pixel averages the block of source
+ * pixels it covers (a box filter): cb = { source width, source height, source pixels per output
+ * pixel across, and down }. When the image is shown at or above its own size this is one tap, as before. */
 static const char k_hlsl_aspect[] =
 "Texture2D t0 : register(t0);\n"
 "SamplerState s0 : register(s0);\n"
+"cbuffer C : register(b0) { float4 src; };\n"
 "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
 "V vs_a(uint id : SV_VertexID) { V o; float2 p = float2((id << 1) & 2, id & 2);\n"
 "  o.uv = p; o.p = float4(p * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-"float4 ps_a(V i) : SV_Target { return float4(t0.Sample(s0, i.uv).rgb, 1.0); }\n";
+"float4 ps_a(V i) : SV_Target {\n"
+"  float2 r = max(src.zw, 1.0);\n"
+"  int nx = (int)min(ceil(r.x), 8.0), ny = (int)min(ceil(r.y), 8.0);\n"
+"  float3 sum = 0; float2 c = i.uv * src.xy;\n"
+"  for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {\n"
+"    float2 o = ((float2(x, y) + 0.5) / float2(nx, ny) - 0.5) * r;\n"
+"    sum += t0.Sample(s0, (c + o) / src.xy).rgb; }\n"
+"  return float4(sum / (nx * ny), 1.0); }\n";
+static ID3D11Buffer *s_asp_cb;
 
 static int aspect_init(void)
 {
@@ -3100,8 +3114,14 @@ static int aspect_init(void)
     if (b0 && b1 &&
         SUCCEEDED(ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(b0), ID3D10Blob_GetBufferSize(b0), NULL, &s_asp_vs)) &&
         SUCCEEDED(ID3D11Device_CreatePixelShader(g.dev, ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1), NULL, &s_asp_ps)) &&
-        SUCCEEDED(ID3D11Device_CreateSamplerState(g.dev, &d, &s_asp_smp)))
-        s_asp_fail = 0;
+        SUCCEEDED(ID3D11Device_CreateSamplerState(g.dev, &d, &s_asp_smp))) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC; bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (SUCCEEDED(ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &s_asp_cb)))
+            s_asp_fail = 0;
+    }
     if (b0) ID3D10Blob_Release(b0);
     if (b1) ID3D10Blob_Release(b1);
     if (s_asp_fail) { logf_("4:3: shader setup failed: stretching instead\n"); s_asp_vs = NULL; }
@@ -3156,6 +3176,17 @@ static int present_aspect(RenderTarget *r)
     ID3D11DeviceContext_IASetPrimitiveTopology(g.ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(g.ctx, s_asp_vs, NULL, 0);
     ID3D11DeviceContext_GSSetShader(g.ctx, NULL, NULL, 0);
+    {   /* source size and how many source pixels one output pixel covers */
+        D3D11_MAPPED_SUBRESOURCE mp;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(g.ctx, (ID3D11Resource *)s_asp_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mp))) {
+            float c[4];
+            c[0] = (float)(r->w * (uint32_t)s_scale); c[1] = (float)(r->h * (uint32_t)s_scale);
+            c[2] = c[0] / (float)vw; c[3] = c[1] / (float)vh;
+            memcpy(mp.pData, c, sizeof c);
+            ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)s_asp_cb, 0);
+        }
+        ID3D11DeviceContext_PSSetConstantBuffers(g.ctx, 0, 1, &s_asp_cb);
+    }
     ID3D11DeviceContext_PSSetShader(g.ctx, s_asp_ps, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 1, &r->srv);
     ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 1, &s_asp_smp);

@@ -40,7 +40,7 @@ typedef struct {
     int def;                 /* the choice shown when the key is missing, and by Reset */
 } VideoOpt;
 
-static const char *const T_RES[] = { "1x  640x480 (Xbox)", "2x  1280x960 (1080p)", "3x  1920x1440 (2K)", "4x  2560x1920", "5x  3200x2400 (4K)" };
+static const char *const T_RES[] = { "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440", "4x  2560x1920", "5x  3200x2400" };
 static const int V_RES[] = { 1, 2, 3, 4, 5 };
 static const char *const T_OFFON[] = { "Off", "On" };
 static const int V_OFFON[] = { 0, 1 };
@@ -52,7 +52,7 @@ static const int V_ANISO[] = { 1, 2, 4, 8, 16 };
 
 #define NVIDEO 6
 static const VideoOpt VIDEO[NVIDEO] = {
-    { "Resolution",         "resolution_scale", 5, T_RES,     V_RES,    0 },
+    { "Render Scale",       "resolution_scale", 5, T_RES,     V_RES,    0 },
     { "Fullscreen",         "fullscreen",       2, T_OFFON,   V_OFFON,  1 },
     { "Stretch image",      "stretch",          2, T_STRETCH, V_OFFON,  0 },
     { "VSync",              "vsync",            2, T_OFFON,   V_OFFON,  0 },
@@ -313,7 +313,7 @@ static void make_ui(HWND h)
         s_vpage[s_nv++] = s_vcombo[i];
     }
     s_vpage[s_nv++] = mk("STATIC", "Fullscreen starts the game in a borderless full-screen window. Stretch image fills the window "
-                                   "instead of keeping the 4:3 picture shape. Resolution is a multiple of the Xbox's 640x480.",
+                                   "instead of keeping the 4:3 picture shape. Render Scale multiplies the size the game is drawn at: 1x is the Xbox's native 640x480.",
                          SS_LEFT, 30, 384, 540, 56, 0, f);
 
     /* Controls tab: the key list and its buttons */
