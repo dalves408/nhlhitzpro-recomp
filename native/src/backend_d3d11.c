@@ -226,7 +226,8 @@ static void settings_load(void)
 static const char *const SET_LABEL[SET_ITEMS] = {
     "Resolution", "Fullscreen", "VSync", "Anisotropic filter", "Close menu", "Quit game" };
 static const char *const SET_RES[5] = {
-    "1x  640x480 (Xbox)", "2x  1280x960 (720p)", "3x  1920x1440 (1080p)", "4x  2560x1920 (2K)", "5x  3200x2400 (4K)" };
+    "1x  640x480 (Xbox)", "2x  1280x960 (~1080p screen)", "3x  1920x1440 (1440p / 2K screen)",
+    "4x  2560x1920 (just under 4K)", "5x  3200x2400 (4K screen)" };
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
 
