@@ -152,6 +152,177 @@ static void aspect_sizing(HWND h, int edge, RECT *rc);
 static void aspect_minmax(HWND h, MINMAXINFO *mm);
 static void aspect_poschanging(HWND h, WINDOWPOS *p);
 
+/* ---- ESC: "Do you want to quit?" overlay ----------------------------------
+ * A layered, non-activating popup owned by the game window, sized to its client
+ * area: the game keeps drawing underneath, dimmed. While it is up the keyboard
+ * goes to the overlay, not the game. ESC opens it (and closes it again); Left /
+ * Right / Tab choose, Enter or Space confirms, Y quits, N closes; the mouse works
+ * too. The pad is not read here, so a controller still reaches the game. */
+static int s_q_active, s_q_sel;            /* sel: 0 = No (default), 1 = Yes */
+static HWND s_q_hwnd;
+static RECT s_q_btn[2];                    /* No, Yes, in overlay client coordinates */
+static int s_q_cw, s_q_ch, s_q_ox, s_q_oy; /* what was last drawn */
+
+static void quit_draw(void);
+
+static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_MOUSEMOVE: {
+        POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
+        int i;
+        for (i = 0; i < 2; i++)
+            if (PtInRect(&s_q_btn[i], pt) && s_q_sel != i) { s_q_sel = i; quit_draw(); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
+        if (PtInRect(&s_q_btn[1], pt)) TerminateProcess(GetCurrentProcess(), 0);
+        if (PtInRect(&s_q_btn[0], pt)) { s_q_active = 0; ShowWindow(h, SW_HIDE); }
+        return 0;
+    }
+    }
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void quit_draw(void)
+{
+    RECT cr;
+    POINT o = { 0, 0 };
+    int cw, ch, dw, dh, dx, dy, bw, bh, by, x, y, i;
+    BITMAPINFO bi;
+    void *bits = NULL;
+    HDC sdc, mdc;
+    HBITMAP bm;
+    HGDIOBJ oldbm, oldf;
+    HFONT ft, fb;
+    uint32_t *px;
+    BLENDFUNCTION bf;
+    POINT p0 = { 0, 0 };
+    SIZE sz;
+    RECT dr;
+    HBRUSH br;
+
+    if (!s_q_hwnd || !g.hwnd || IsIconic(g.hwnd)) return;
+    GetClientRect(g.hwnd, &cr);
+    ClientToScreen(g.hwnd, &o);
+    cw = cr.right; ch = cr.bottom;
+    if (cw <= 0 || ch <= 0) return;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = cw; bi.bmiHeader.biHeight = -ch;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bm || !bits) { if (bm) DeleteObject(bm); DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    oldbm = SelectObject(mdc, bm);
+    px = (uint32_t *)bits;
+    for (i = 0; i < cw * ch; i++) px[i] = 0x96000000u;          /* dim: black, alpha 150 */
+
+    dw = ch * 4 / 5; if (dw > cw * 9 / 10) dw = cw * 9 / 10;
+    dh = dw * 9 / 20;
+    dx = (cw - dw) / 2; dy = (ch - dh) / 2;
+    SetRect(&dr, dx, dy, dx + dw, dy + dh);
+    br = CreateSolidBrush(RGB(255, 122, 0)); FillRect(mdc, &dr, br); DeleteObject(br);
+    InflateRect(&dr, -dh / 40 - 2, -dh / 40 - 2);
+    br = CreateSolidBrush(RGB(14, 22, 40)); FillRect(mdc, &dr, br); DeleteObject(br);
+
+    bw = dw * 3 / 10; bh = dh * 28 / 100; by = dy + dh * 58 / 100;
+    SetRect(&s_q_btn[0], dx + dw / 2 - bw - dw / 25, by, dx + dw / 2 - dw / 25, by + bh);
+    SetRect(&s_q_btn[1], dx + dw / 2 + dw / 25, by, dx + dw / 2 + dw / 25 + bw, by + bh);
+    SetBkMode(mdc, TRANSPARENT);
+    ft = CreateFontA(-(dh * 17 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Impact");
+    fb = CreateFontA(-(dh * 15 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Impact");
+    oldf = SelectObject(mdc, ft);
+    SetTextColor(mdc, RGB(255, 255, 255));
+    SetRect(&dr, dx, dy + dh * 12 / 100, dx + dw, dy + dh * 50 / 100);
+    DrawTextA(mdc, "Do you want to quit?", -1, &dr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mdc, fb);
+    for (i = 0; i < 2; i++) {
+        int on = (s_q_sel == i);
+        br = CreateSolidBrush(on ? RGB(255, 122, 0) : RGB(52, 60, 78));
+        FillRect(mdc, &s_q_btn[i], br); DeleteObject(br);
+        SetTextColor(mdc, on ? RGB(10, 10, 14) : RGB(200, 210, 225));
+        DrawTextA(mdc, i ? "YES" : "NO", -1, &s_q_btn[i], DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(mdc, oldf);
+    DeleteObject(ft); DeleteObject(fb);
+    GdiFlush();
+    for (y = dy; y < dy + dh; y++)                                /* the dialog itself is opaque */
+        for (x = dx; x < dx + dw; x++)
+            px[(size_t)y * cw + x] |= 0xFF000000u;
+
+    bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0; bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
+    sz.cx = cw; sz.cy = ch;
+    UpdateLayeredWindow(s_q_hwnd, sdc, &o, &sz, mdc, &p0, 0, &bf, ULW_ALPHA);
+    s_q_cw = cw; s_q_ch = ch; s_q_ox = o.x; s_q_oy = o.y;
+    SelectObject(mdc, oldbm);
+    DeleteObject(bm); DeleteDC(mdc); ReleaseDC(NULL, sdc);
+}
+
+static void quit_open(void)
+{
+    if (!s_q_hwnd) {
+        WNDCLASSA wc;
+        memset(&wc, 0, sizeof wc);
+        wc.lpfnWndProc = quit_wndproc;
+        wc.hInstance = GetModuleHandleA(NULL);
+        wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
+        wc.lpszClassName = "NhlQuitOverlay";
+        RegisterClassA(&wc);
+        s_q_hwnd = CreateWindowExA(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, wc.lpszClassName, "",
+                                   WS_POPUP, 0, 0, 1, 1, g.hwnd, NULL, wc.hInstance, NULL);
+        if (!s_q_hwnd) return;
+    }
+    xbox_InputKeysClear();            /* nothing the game saw as held stays held */
+    s_q_sel = 0; s_q_active = 1;
+    quit_draw();
+    ShowWindow(s_q_hwnd, SW_SHOWNOACTIVATE);
+}
+
+static void quit_close(void)
+{
+    s_q_active = 0;
+    if (s_q_hwnd) ShowWindow(s_q_hwnd, SW_HIDE);
+}
+
+/* Per frame: follow the game window when it moves or is resized. */
+static void quit_tick(void)
+{
+    RECT cr;
+    POINT o = { 0, 0 };
+    if (!s_q_active || !g.hwnd) return;
+    if (IsIconic(g.hwnd)) return;
+    GetClientRect(g.hwnd, &cr);
+    ClientToScreen(g.hwnd, &o);
+    if (cr.right != s_q_cw || cr.bottom != s_q_ch || o.x != s_q_ox || o.y != s_q_oy) quit_draw();
+}
+
+/* A key message for the game window; 1 when the overlay took it. */
+static int quit_key(WPARAM w, LPARAM l, int down)
+{
+    int repeat = (l & (1L << 30)) != 0;
+    if (w == VK_ESCAPE) {
+        if (down && !repeat) { if (s_q_active) quit_close(); else quit_open(); }
+        return 1;
+    }
+    if (!s_q_active) return 0;
+    if (down && (w == VK_LEFT || w == VK_RIGHT || w == VK_TAB || w == 'A' || w == 'D')) {
+        s_q_sel = (w == VK_LEFT || w == 'A') ? 0 : (w == VK_RIGHT || w == 'D') ? 1 : !s_q_sel;
+        quit_draw();
+    } else if (down && !repeat && (w == VK_RETURN || w == VK_SPACE)) {
+        if (s_q_sel) TerminateProcess(GetCurrentProcess(), 0);
+        quit_close();
+    } else if (down && !repeat && w == 'Y') {
+        TerminateProcess(GetCurrentProcess(), 0);
+    } else if (down && !repeat && w == 'N') {
+        quit_close();
+    }
+    return 1;
+}
+
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -177,12 +348,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (!(l & (1L << 30))) toggle_fullscreen(h);
             return 0;
         }
+        if (quit_key(w, l, 1)) return 0;   /* ESC quit overlay */
         if (!(l & (1L << 30)))          /* not an auto-repeat */
             keylog((int)w, 1);
         xbox_InputKeySet((int)w, 1);
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
         if (w == VK_F11 && f11_on()) return 0;
+        if (quit_key(w, l, 0)) return 0;
         keylog((int)w, 0);
         xbox_InputKeySet((int)w, 0);
         return 0;
@@ -2579,6 +2752,7 @@ static void be_flip(void)
     }
 #endif
     pump_messages();
+    quit_tick();
     if (g.log && (g.flips % 300) == 0)
         logf_("flips=%u t=%.1fs rcdraws=%u specs=%u specfail=%u spec_ms=%llu draws=%u tris=%u textures=%d decodes=%llu uploads=%llu decode_ms=%llu hash_ms=%llu\n",
               g.flips, (GetTickCount() - g.t0) / 1000.0, g.rc_draws, s_nspec, s_spec_fail, (unsigned long long)s_spec_ms, g.draws, g.tris, s_ntex,
