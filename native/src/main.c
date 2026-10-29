@@ -419,6 +419,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    {
+        /* Per-monitor DPI awareness (Windows 10 1703+): without it Windows draws the game
+         * at 96 dpi and stretches it, which blurs fullscreen on a scaled (e.g. 4K at 200%)
+         * display. The window then works in real pixels. */
+        typedef BOOL (WINAPI *set_dpi_ctx_fn)(HANDLE);
+        HMODULE u32 = GetModuleHandleA("user32.dll");
+        set_dpi_ctx_fn f = u32 ? (set_dpi_ctx_fn)(void *)GetProcAddress(u32, "SetProcessDpiAwarenessContext") : NULL;
+        if (f) f((HANDLE)(INT_PTR)-4);          /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+    }
 #ifdef NHL_RELEASE
     release_init();
 #endif

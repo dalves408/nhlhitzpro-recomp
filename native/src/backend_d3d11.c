@@ -144,8 +144,11 @@ static void keylog(int vk, int down)
 }
 
 static int aspect_on(void);
+static int s_fs;                    /* borderless fullscreen is on */
 static int f11_on(void);
 static void toggle_fullscreen(HWND h);
+static void user_toggle_fullscreen(HWND h);
+static int want_fullscreen_at_start(void);
 static void aspect_on_size(void);
 static int aspect_window(void);
 static void aspect_sizing(HWND h, int edge, RECT *rc);
@@ -352,7 +355,11 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
         if (w == VK_F11 && f11_on()) {  /* RECOMP_F11_FULLSCREEN: ours, never the game's */
-            if (!(l & (1L << 30))) toggle_fullscreen(h);
+            if (!(l & (1L << 30))) user_toggle_fullscreen(h);
+            return 0;
+        }
+        if (w == VK_RETURN && (l & (1L << 29)) && f11_on()) {   /* Alt+Enter, like F11 */
+            if (!(l & (1L << 30))) user_toggle_fullscreen(h);
             return 0;
         }
         if (quit_key(w, l, 1)) return 0;   /* ESC quit overlay */
@@ -362,10 +369,14 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_KEYUP: case WM_SYSKEYUP:
         if (w == VK_F11 && f11_on()) return 0;
+        if (w == VK_RETURN && m == WM_SYSKEYUP && f11_on()) return 0;   /* the Alt+Enter release */
         if (quit_key(w, l, 0)) return 0;
         keylog((int)w, 0);
         xbox_InputKeySet((int)w, 0);
         return 0;
+    case WM_SETCURSOR:              /* borderless fullscreen: no mouse pointer over the game */
+        if (s_fs && !s_q_active && LOWORD(l) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        break;
     case WM_KILLFOCUS:
         xbox_InputKeysClear();
         break;
@@ -410,6 +421,7 @@ static int init_window_and_device(void)
                              WS_OVERLAPPEDWINDOW | WS_VISIBLE, 100, 100, 656, 519,
                              NULL, NULL, wc.hInstance, NULL);
     if (!g.hwnd) { logf_("CreateWindow failed (%lu)\n", GetLastError()); g.failed = 1; return 0; }
+    if (f11_on() && want_fullscreen_at_start()) toggle_fullscreen(g.hwnd);
 
     if (getenv("RECOMP_D3D11_DEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
     hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, flags, want, 3,
@@ -425,29 +437,45 @@ static int init_window_and_device(void)
 }
 
 /* (Re)create the swap chain for a w x h presentation. */
+static int s_fs;                    /* borderless fullscreen is on (defined with toggle_fullscreen) */
+
+/* The window's DPI as a percentage of 96 (the process is per-monitor DPI aware). */
+static int dpi_pct(HWND h)
+{
+    typedef UINT (WINAPI *get_dpi_fn)(HWND);
+    HMODULE u32 = GetModuleHandleA("user32.dll");
+    get_dpi_fn f = u32 ? (get_dpi_fn)(void *)GetProcAddress(u32, "GetDpiForWindow") : NULL;
+    UINT d = f ? f(h) : 96;
+    return d ? (int)(d * 100 / 96) : 100;
+}
+
 static int ensure_swap(uint32_t w, uint32_t h)
 {
     HRESULT hr;
 
     if (g.swap && g.swap_w == w && g.swap_h == h) return 1;
     if (g.swap) {
-        RECT r = { 0, 0, (LONG)w, (LONG)h };
+        int pct = aspect_on() ? dpi_pct(g.hwnd) : 100;
+        RECT r = { 0, 0, (LONG)(w * pct / 100), (LONG)(h * pct / 100) };
         if (g.back) { ID3D11Texture2D_Release(g.back); g.back = NULL; }
         hr = IDXGISwapChain_ResizeBuffers(g.swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0);
         if (FAILED(hr)) { logf_("ResizeBuffers 0x%08lX\n", (unsigned long)hr); return 0; }
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(g.hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                     SWP_NOMOVE | SWP_NOZORDER);
+        if (!s_fs)                  /* fullscreen keeps the monitor-sized window */
+            SetWindowPos(g.hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                         SWP_NOMOVE | SWP_NOZORDER);
     } else {
         IDXGIDevice *dxd = NULL;
         IDXGIAdapter *ad = NULL;
         IDXGIFactory *fac = NULL;
         DXGI_SWAP_CHAIN_DESC sd;
-        RECT r = { 0, 0, (LONG)w, (LONG)h };
+        int pct = aspect_on() ? dpi_pct(g.hwnd) : 100;
+        RECT r = { 0, 0, (LONG)(w * pct / 100), (LONG)(h * pct / 100) };
 
         AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-        SetWindowPos(g.hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
-                     SWP_NOMOVE | SWP_NOZORDER);
+        if (!s_fs)                  /* fullscreen keeps the monitor-sized window */
+            SetWindowPos(g.hwnd, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                         SWP_NOMOVE | SWP_NOZORDER);
         memset(&sd, 0, sizeof sd);
         sd.BufferDesc.Width = w;
         sd.BufferDesc.Height = h;
@@ -2409,6 +2437,45 @@ static void toggle_fullscreen(HWND h)
                      SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
         logf_("F11: windowed\n");
     }
+}
+
+/* The player build starts fullscreen and remembers the last mode in
+ * %LOCALAPPDATA%\NHLHitzPro\settings.ini ("fullscreen=1" or "fullscreen=0"). */
+#ifdef NHL_RELEASE
+static int settings_path(char *out, size_t n)
+{
+    char base[MAX_PATH];
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
+        return 0;
+    snprintf(out, n, "%s\\NHLHitzPro", base);
+    CreateDirectoryA(out, NULL);
+    snprintf(out, n, "%s\\NHLHitzPro\\settings.ini", base);
+    return 1;
+}
+
+static int want_fullscreen_at_start(void)
+{
+    char path[MAX_PATH];
+    if (!settings_path(path, sizeof path)) return 1;
+    return GetPrivateProfileIntA("display", "fullscreen", 1, path) != 0;
+}
+
+static void save_fullscreen_setting(int fs)
+{
+    char path[MAX_PATH];
+    if (settings_path(path, sizeof path))
+        WritePrivateProfileStringA("display", "fullscreen", fs ? "1" : "0", path);
+}
+#else
+static int want_fullscreen_at_start(void) { return 0; }
+static void save_fullscreen_setting(int fs) { (void)fs; }
+#endif
+
+/* F11 or Alt+Enter: switch, and remember the choice. */
+static void user_toggle_fullscreen(HWND h)
+{
+    toggle_fullscreen(h);
+    save_fullscreen_setting(s_fs);
 }
 
 /* RECOMP_ASPECT_4_3, windowed: the window itself keeps a 4:3 client area, so there are no

@@ -29,7 +29,7 @@ Saves and the shader cache are kept in `%LOCALAPPDATA%\NHLHitzPro`. Uninstalling
 | Start | Start | Enter |
 | A / B / X / Y | A / B / X / Y | Z / X / C / V |
 | Move, D-pad | Left stick, D-pad | W A S D, arrow keys |
-| Fullscreen | | F11 |
+| Fullscreen / window | | F11 or Alt+Enter (starts fullscreen; the last mode is remembered) |
 | Pause and quit | | Esc pauses the game and asks to quit: Yes (Y or Enter) or No (N or Esc, resumes) |
 
 An XInput controller (Xbox 360, Xbox One, most PC pads) works without setup. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
