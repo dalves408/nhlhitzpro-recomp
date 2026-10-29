@@ -1,7 +1,7 @@
 ; Inno Setup script for the NHL Hitz Pro recompilation (Windows 10/11, 64-bit).
 ; Build the player exe and the import tool first:
 ;   cmake -S native -B native/build-release -DNHL_RELEASE=ON
-;   cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp nhl_import
+;   cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp nhl_import nhl_config
 ; then compile this script with ISCC.exe. Output: native\installer\Output\NHLHitzPro-Setup-1.0.0.exe
 #define AppVersion "1.0.0"
 #define BuildDir "..\build-release\Release"
@@ -32,11 +32,13 @@ WelcomeLabel2=This installs the NHL Hitz Pro PC recompilation.%n%nThe game's own
 
 [Files]
 Source: "{#BuildDir}\nhl_hitz_pro_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\nhl_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 
 [Icons]
 Name: "{autoprograms}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\NHL Hitz Pro Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]

@@ -73,6 +73,12 @@ get_target_property(usb_sources xbox_usb SOURCES)
 list(REMOVE_ITEM usb_sources ohci.c usb_gamepad.c)
 set_property(TARGET xbox_usb PROPERTY SOURCES "${usb_sources}")
 target_sources(xbox_usb PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/ohci.c" "${CMAKE_CURRENT_SOURCE_DIR}/overrides/usb_gamepad.c")
+# Project-local copy of keyboard.c: the key map can be changed by the player (config.exe, keymap.ini).
+get_target_property(input_sources xbox_input SOURCES)
+list(REMOVE_ITEM input_sources keyboard.c)
+set_property(TARGET xbox_input PROPERTY SOURCES "${input_sources}")
+target_sources(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/keyboard.c")
+target_include_directories(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
 # Project-local copy of host_time.c: a pausable host clock and a timer thread that holds while paused.
 get_target_property(host_time_sources host_time SOURCES)
 list(REMOVE_ITEM host_time_sources host_time.c)
@@ -131,6 +137,12 @@ add_executable(${PROJECT_NAME} WIN32
 add_executable(nhl_import installer/nhl_import.c)
 target_link_libraries(nhl_import PRIVATE bcrypt shell32)
 set_property(TARGET nhl_import PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+
+# config.exe: the player's settings program, installed next to the game (keyboard remapper for now).
+add_executable(nhl_config WIN32 config/config.c resources/config.rc)
+target_link_libraries(nhl_config PRIVATE comctl32 user32 gdi32)
+set_target_properties(nhl_config PROPERTIES OUTPUT_NAME config)
+set_property(TARGET nhl_config PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
