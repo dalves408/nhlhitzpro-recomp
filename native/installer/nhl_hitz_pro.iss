@@ -3,7 +3,7 @@
 ;   cmake -S native -B native/build-release -DNHL_RELEASE=ON
 ;   cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp nhl_import nhl_config
 ; then compile this script with ISCC.exe. Output: native\installer\Output\NHLHitzPro-Setup-1.0.1.exe
-#define AppVersion "1.0.1"
+#define AppVersion "1.0.2"
 #define BuildDir "..\build-release\Release"
 
 [Setup]
