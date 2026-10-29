@@ -164,6 +164,10 @@ static RECT s_q_btn[2];                    /* No, Yes, in overlay client coordin
 static int s_q_cw, s_q_ch, s_q_ox, s_q_oy; /* what was last drawn */
 
 static void quit_draw(void);
+static void quit_close(void);
+extern void xbox_time_pause_begin(void);   /* kernel_hal.c override */
+extern void xbox_time_pause_end(void);
+extern void xa2_set_muted(int muted);      /* apu_xaudio2.c override */
 
 static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -179,7 +183,7 @@ static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_LBUTTONDOWN: {
         POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
         if (PtInRect(&s_q_btn[1], pt)) TerminateProcess(GetCurrentProcess(), 0);
-        if (PtInRect(&s_q_btn[0], pt)) { s_q_active = 0; ShowWindow(h, SW_HIDE); }
+        if (PtInRect(&s_q_btn[0], pt)) quit_close();
         return 0;
     }
     }
@@ -278,12 +282,15 @@ static void quit_open(void)
     }
     xbox_InputKeysClear();            /* nothing the game saw as held stays held */
     s_q_sel = 0; s_q_active = 1;
+    xbox_time_pause_begin();          /* the game's clocks stop; present() holds below */
+    xa2_set_muted(1);
     quit_draw();
     ShowWindow(s_q_hwnd, SW_SHOWNOACTIVATE);
 }
 
 static void quit_close(void)
 {
+    if (s_q_active) { xa2_set_muted(0); xbox_time_pause_end(); }
     s_q_active = 0;
     if (s_q_hwnd) ShowWindow(s_q_hwnd, SW_HIDE);
 }
@@ -2753,6 +2760,8 @@ static void be_flip(void)
 #endif
     pump_messages();
     quit_tick();
+    /* Paused: the flip does not return, so the game stops here until the overlay closes. */
+    while (s_q_active) { Sleep(8); pump_messages(); quit_tick(); }
     if (g.log && (g.flips % 300) == 0)
         logf_("flips=%u t=%.1fs rcdraws=%u specs=%u specfail=%u spec_ms=%llu draws=%u tris=%u textures=%d decodes=%llu uploads=%llu decode_ms=%llu hash_ms=%llu\n",
               g.flips, (GetTickCount() - g.t0) / 1000.0, g.rc_draws, s_nspec, s_spec_fail, (unsigned long long)s_spec_ms, g.draws, g.tris, s_ntex,

@@ -48,7 +48,7 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # Project-local runtime diagnostics; preserve the pinned toolkit checkout.
 get_target_property(kernel_sources xbox_kernel SOURCES)
-list(REMOVE_ITEM kernel_sources xbox_memory_layout.c nv2a_vsh_interp.c nv2a_combiner.c nv2a_pb_exec.c kernel_file.c kernel_path.c)
+list(REMOVE_ITEM kernel_sources xbox_memory_layout.c nv2a_vsh_interp.c nv2a_combiner.c nv2a_pb_exec.c kernel_file.c kernel_path.c kernel_hal.c)
 set_property(TARGET xbox_kernel PROPERTY SOURCES "${kernel_sources}")
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/xbox_memory_layout.c")
 # Project-local copy of the NV2A vertex-program interpreter (predecoded slots + RECOMP_VSH_PROFILE).
@@ -61,11 +61,20 @@ target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_p
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_file.c")
 # Project-local copy of kernel_path.c: no Partition0..5.img files are created (kernel_file.c emulates the partition devices in memory).
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_path.c")
+# Project-local copy of kernel_hal.c: guest clocks that can be paused (ESC quit overlay).
+target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_hal.c")
 
 get_target_property(apu_sources xbox_apu SOURCES)
-list(REMOVE_ITEM apu_sources apu_vp.c)
+list(REMOVE_ITEM apu_sources apu_vp.c apu_xaudio2.c)
 set_property(TARGET xbox_apu PROPERTY SOURCES "${apu_sources}")
 target_sources(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/apu_vp.c")
+# Project-local copy of host_time.c: a pausable host clock and a timer thread that holds while paused.
+get_target_property(host_time_sources host_time SOURCES)
+list(REMOVE_ITEM host_time_sources host_time.c)
+set_property(TARGET host_time PROPERTY SOURCES "${host_time_sources}")
+target_sources(host_time PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/host_time.c")
+# Project-local copy of apu_xaudio2.c: xa2_set_muted, used while paused.
+target_sources(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/apu_xaudio2.c")
 
 
 # Upstream runtime targets force /O2 even in Debug, conflicting with /RTC1.
