@@ -28,6 +28,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 SetupIconFile=..\resources\nhl_hitz_pro.ico
+; the picture at the top right of every wizard page is the same icon (the sizes are for different screen scalings)
+WizardSmallImageFile=wizard_small_55.bmp,wizard_small_64.bmp,wizard_small_80.bmp,wizard_small_96.bmp,wizard_small_128.bmp
 UninstallDisplayIcon={app}\nhl_hitz_pro_recomp.exe
 OutputBaseFilename=NHLHitzPro-Setup-{#AppVersion}
 Compression=lzma2
