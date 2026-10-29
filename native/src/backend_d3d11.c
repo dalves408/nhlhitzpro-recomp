@@ -166,6 +166,250 @@ static HWND s_q_hwnd;
 static RECT s_q_btn[2];                    /* No, Yes, in overlay client coordinates */
 static int s_q_cw, s_q_ch, s_q_ox, s_q_oy; /* what was last drawn */
 
+/* ---- F1: settings menu ------------------------------------------------------
+ * The same layered overlay window as the quit prompt, in another mode, and the same pause
+ * (clocks, vblank thread, flips and sound all stop while it is open). Up/Down choose a
+ * line, Left/Right (or Enter) change it, Esc or F1 close it; the mouse works too. Choices
+ * are saved at once in %LOCALAPPDATA%\NHLHitzPro\settings.ini, [display]:
+ *   resolution_scale = 1..5   internal resolution, a multiple of the Xbox's 640x480
+ *   vsync, anisotropy (1, 2, 4, 8, 16), fullscreen (see want_fullscreen_at_start) */
+static int s_scale = 1;           /* internal resolution: 1..5 x the Xbox's 640x480 */
+static int s_scale_applied = 1;   /* the scale the render targets in g.rt were made at */
+static int s_aniso = 1;           /* anisotropic filtering: 1 (off), 2, 4, 8, 16 */
+static int s_set_active, s_set_sel, s_set_armed;
+static RECT s_set_row[6];
+static int s_ztex_flush;          /* zeta_as_texture: drop its cached copies */
+static void rt_reset_all(void);
+
+#define SET_ITEMS 6
+
+static int cfg_path(char *out, size_t n)
+{
+    char base[MAX_PATH];
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
+        return 0;
+    snprintf(out, n, "%s\\NHLHitzPro", base);
+    CreateDirectoryA(out, NULL);
+    snprintf(out, n, "%s\\NHLHitzPro\\settings.ini", base);
+    return 1;
+}
+
+static int cfg_get(const char *key, int def)
+{
+    char path[MAX_PATH];
+    return cfg_path(path, sizeof path) ? (int)GetPrivateProfileIntA("display", key, def, path) : def;
+}
+
+static void cfg_put(const char *key, int v)
+{
+    char path[MAX_PATH], val[16];
+    if (!cfg_path(path, sizeof path)) return;
+    snprintf(val, sizeof val, "%d", v);
+    WritePrivateProfileStringA("display", key, val, path);
+}
+
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+static void settings_load(void)
+{
+    const char *e = getenv("RECOMP_D3D11_SCALE");
+    int a;
+    s_scale = clampi(cfg_get("resolution_scale", 1), 1, 5);
+    if (e && *e) s_scale = clampi(atoi(e), 1, 5);
+    s_scale_applied = s_scale;
+    a = cfg_get("anisotropy", 1);
+    s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
+    if (!getenv("RECOMP_D3D11_VSYNC"))
+        g.vsync = cfg_get("vsync", 0) != 0;
+}
+
+static const char *const SET_LABEL[SET_ITEMS] = {
+    "Resolution", "Fullscreen", "VSync", "Anisotropic filter", "Close menu", "Quit game" };
+static const char *const SET_RES[5] = {
+    "1x  640x480 (Xbox)", "2x  1280x960", "3x  1920x1440", "4x  2560x1920", "5x  3200x2400" };
+static const char *const SET_OFFON[2] = { "Off", "On" };
+static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
+
+static int set_count(int i) { return i == 0 ? 5 : i == 3 ? 5 : i <= 2 ? 2 : 0; }
+
+static int set_get(int i)
+{
+    switch (i) {
+    case 0: return s_scale - 1;
+    case 1: return s_fs ? 1 : 0;
+    case 2: return g.vsync ? 1 : 0;
+    case 3: return s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : s_aniso >= 2 ? 1 : 0;
+    }
+    return 0;
+}
+
+static const char *set_text(int i)
+{
+    int v = set_get(i);
+    switch (i) {
+    case 0: return SET_RES[v];
+    case 3: return SET_ANISO[v];
+    case 1: case 2: return SET_OFFON[v];
+    }
+    return "";
+}
+
+static void set_put(int i, int v)
+{
+    switch (i) {
+    case 0: s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;   /* applied by the next draw */
+    case 1: user_toggle_fullscreen(g.hwnd); break;
+    case 2: g.vsync = v; cfg_put("vsync", v); break;
+    case 3: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
+    }
+}
+
+static void set_draw(void)
+{
+    RECT cr, rr;
+    POINT o = { 0, 0 };
+    int cw, ch, dw, dh, dx, dy, rh, i, x, y;
+    BITMAPINFO bi;
+    void *bits = NULL;
+    HDC sdc, mdc;
+    HBITMAP bm;
+    HGDIOBJ oldbm, oldf;
+    HFONT ft, fr;
+    uint32_t *px;
+    BLENDFUNCTION bf;
+    POINT p0 = { 0, 0 };
+    SIZE sz;
+    HBRUSH br;
+
+    if (!s_q_hwnd || !g.hwnd || IsIconic(g.hwnd)) return;
+    GetClientRect(g.hwnd, &cr);
+    ClientToScreen(g.hwnd, &o);
+    cw = cr.right; ch = cr.bottom;
+    if (cw <= 0 || ch <= 0) return;
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = cw; bi.bmiHeader.biHeight = -ch;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bm || !bits) { if (bm) DeleteObject(bm); DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    oldbm = SelectObject(mdc, bm);
+    px = (uint32_t *)bits;
+    for (i = 0; i < cw * ch; i++) px[i] = 0x96000000u;
+
+    rh = ch * 7 / 100; if (rh < 22) rh = 22;
+    dw = rh * 17;
+    if (dw > cw * 95 / 100) { dw = cw * 95 / 100; rh = dw / 17; }
+    dh = rh * 93 / 10;
+    dx = (cw - dw) / 2; dy = (ch - dh) / 2;
+    SetRect(&rr, dx, dy, dx + dw, dy + dh);
+    br = CreateSolidBrush(RGB(255, 122, 0)); FillRect(mdc, &rr, br); DeleteObject(br);
+    InflateRect(&rr, -(dh / 40 + 2), -(dh / 40 + 2));          /* the quit prompt's frame */
+    br = CreateSolidBrush(RGB(14, 22, 40)); FillRect(mdc, &rr, br); DeleteObject(br);
+
+    SetBkMode(mdc, TRANSPARENT);
+    ft = CreateFontA(-(rh * 80 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Impact");
+    fr = CreateFontA(-(rh * 56 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Bahnschrift SemiCondensed");
+    oldf = SelectObject(mdc, ft);
+    SetTextColor(mdc, RGB(255, 255, 255));
+    SetRect(&rr, dx, dy + rh / 4, dx + dw, dy + rh * 13 / 10);
+    DrawTextA(mdc, "SETTINGS", -1, &rr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mdc, fr);
+    for (i = 0; i < SET_ITEMS; i++) {
+        int sel = (i == s_set_sel);
+        char buf[96];
+        y = dy + rh * 14 / 10 + i * rh;
+        x = dx + rh / 3;
+        SetRect(&s_set_row[i], x, y, dx + dw - rh / 3, y + rh * 82 / 100);
+        br = CreateSolidBrush(sel ? RGB(255, 122, 0) : RGB(52, 60, 78));   /* the quit prompt's buttons */
+        FillRect(mdc, &s_set_row[i], br); DeleteObject(br);
+        SetTextColor(mdc, sel ? RGB(10, 10, 14) : RGB(200, 210, 225));
+        rr = s_set_row[i]; rr.left += rh / 3;
+        DrawTextA(mdc, SET_LABEL[i], -1, &rr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        rr = s_set_row[i]; rr.right -= rh / 3;
+        if (set_count(i))
+            snprintf(buf, sizeof buf, "<  %s  >", set_text(i));
+        else if (i == 5 && s_set_armed)
+            snprintf(buf, sizeof buf, "press again to quit");
+        else
+            buf[0] = 0;
+        DrawTextA(mdc, buf, -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    SetTextColor(mdc, RGB(150, 162, 182));
+    SetRect(&rr, dx + rh / 3, dy + rh * 14 / 10 + SET_ITEMS * rh + rh / 6, dx + dw - rh / 3, dy + dh - rh / 8);
+    {
+        HFONT fh = CreateFontA(-(rh * 38 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, "Bahnschrift SemiCondensed");
+        HGDIOBJ prev = SelectObject(mdc, fh);
+        DrawTextA(mdc, "Up/Down choose, Left/Right change. Saved automatically. F1 or Esc closes.", -1, &rr, DT_LEFT | DT_WORDBREAK);
+        SelectObject(mdc, prev);
+        DeleteObject(fh);
+    }
+    SelectObject(mdc, oldf);
+    DeleteObject(ft); DeleteObject(fr);
+    GdiFlush();
+    for (y = dy; y < dy + dh; y++)
+        for (x = dx; x < dx + dw; x++)
+            px[(size_t)y * cw + x] |= 0xFF000000u;
+
+    bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0; bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
+    sz.cx = cw; sz.cy = ch;
+    UpdateLayeredWindow(s_q_hwnd, sdc, &o, &sz, mdc, &p0, 0, &bf, ULW_ALPHA);
+    s_q_cw = cw; s_q_ch = ch; s_q_ox = o.x; s_q_oy = o.y;
+    SelectObject(mdc, oldbm);
+    DeleteObject(bm); DeleteDC(mdc); ReleaseDC(NULL, sdc);
+}
+
+static void quit_close(void);
+
+/* Left/Right/Enter on line i. */
+static void set_change(int i, int dir)
+{
+    int n = set_count(i);
+    if (n) {
+        int v = (set_get(i) + dir + n) % n;
+        if (i == 1) v = !s_fs;
+        set_put(i, v);
+        s_set_armed = 0;
+    } else if (dir == 0) {
+        if (i == 4) quit_close();
+        else if (i == 5) {
+            if (s_set_armed) TerminateProcess(GetCurrentProcess(), 0);
+            s_set_armed = 1;
+        }
+    }
+    set_draw();
+}
+
+static int set_key(WPARAM w, LPARAM l, int down)
+{
+    int repeat = (l & (1L << 30)) != 0;
+    if (!down) return 1;
+    if (w == VK_ESCAPE || w == VK_F1) { if (!repeat) quit_close(); return 1; }
+    if (w == VK_UP || w == VK_DOWN) {
+        s_set_sel = (s_set_sel + (w == VK_UP ? SET_ITEMS - 1 : 1)) % SET_ITEMS;
+        s_set_armed = 0;
+        set_draw();
+    } else if (w == VK_LEFT) set_change(s_set_sel, -1);
+    else if (w == VK_RIGHT) set_change(s_set_sel, +1);
+    else if ((w == VK_RETURN || w == VK_SPACE) && !repeat)
+        set_change(s_set_sel, set_count(s_set_sel) ? +1 : 0);
+    return 1;
+}
+
+static LRESULT set_mouse(UINT m, LPARAM l)
+{
+    POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
+    int i;
+    for (i = 0; i < SET_ITEMS; i++)
+        if (PtInRect(&s_set_row[i], pt)) {
+            if (m == WM_MOUSEMOVE) { if (s_set_sel != i) { s_set_sel = i; s_set_armed = 0; set_draw(); } }
+            else { s_set_sel = i; set_change(i, set_count(i) ? +1 : 0); }
+            break;
+        }
+    return 0;
+}
+
 static void quit_draw(void);
 static void quit_close(void);
 extern void xbox_time_pause_begin(void);   /* kernel_hal.c override */
@@ -174,6 +418,8 @@ extern void xa2_set_muted(int muted);      /* apu_xaudio2.c override */
 
 static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (s_set_active && (m == WM_MOUSEMOVE || m == WM_LBUTTONDOWN))
+        return set_mouse(m, l);
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_MOUSEMOVE: {
@@ -196,6 +442,7 @@ static LRESULT CALLBACK quit_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 static void quit_draw(void)
 {
     RECT cr;
+    if (s_set_active) { set_draw(); return; }
     POINT o = { 0, 0 };
     int cw, ch, dw, dh, dx, dy, bw, bh, by, x, y, i;
     BITMAPINFO bi;
@@ -295,7 +542,14 @@ static void quit_close(void)
 {
     if (s_q_active) { xa2_set_muted(0); xbox_time_pause_end(); }
     s_q_active = 0;
+    s_set_active = 0; s_set_armed = 0;
     if (s_q_hwnd) ShowWindow(s_q_hwnd, SW_HIDE);
+}
+
+static void set_open(void)
+{
+    s_set_active = 1; s_set_sel = 0; s_set_armed = 0;
+    quit_open();
 }
 
 /* Per frame: follow the game window when it moves or is resized. */
@@ -314,6 +568,7 @@ static void quit_tick(void)
 static int quit_key(WPARAM w, LPARAM l, int down)
 {
     int repeat = (l & (1L << 30)) != 0;
+    if (s_q_active && s_set_active) return set_key(w, l, down);
     if (w == VK_ESCAPE) {
         if (down && !repeat) { if (s_q_active) quit_close(); else quit_open(); }
         return 1;
@@ -362,6 +617,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             if (!(l & (1L << 30))) user_toggle_fullscreen(h);
             return 0;
         }
+        if (w == VK_F1) {                  /* settings menu */
+            if (!(l & (1L << 30))) { if (!s_q_active) set_open(); else if (s_set_active) quit_close(); }
+            return 0;
+        }
         if (quit_key(w, l, 1)) return 0;   /* ESC quit overlay */
         if (!(l & (1L << 30)))          /* not an auto-repeat */
             keylog((int)w, 1);
@@ -370,6 +629,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_KEYUP: case WM_SYSKEYUP:
         if (w == VK_F11 && f11_on()) return 0;
         if (w == VK_RETURN && m == WM_SYSKEYUP && f11_on()) return 0;   /* the Alt+Enter release */
+        if (w == VK_F1) return 0;
         if (quit_key(w, l, 0)) return 0;
         keylog((int)w, 0);
         xbox_InputKeySet((int)w, 0);
@@ -397,6 +657,7 @@ static int init_window_and_device(void)
     if (g.inited) return !g.failed;
     g.inited = 1;
     g.vsync = getenv("RECOMP_D3D11_VSYNC") && getenv("RECOMP_D3D11_VSYNC")[0] == '1';
+    settings_load();
     g.log   = getenv("RECOMP_D3D11_LOG") != NULL;
     g.hash_every_use = getenv("RECOMP_D3D11_HASH_EVERY_USE") != NULL;
     g.dump_prefix = getenv("RECOMP_FB_DUMP");
@@ -529,8 +790,8 @@ static RenderTarget *get_rt(const Nv2aSurface *s)
     r = &g.rt[g.nrt];
     memset(r, 0, sizeof *r);
     memset(&td, 0, sizeof td);
-    td.Width = s->width;
-    td.Height = s->height;
+    td.Width = s->width * (UINT)s_scale;       /* internal resolution: a multiple of the Xbox's */
+    td.Height = s->height * (UINT)s_scale;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1374,7 +1635,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
 
 static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 {
-    uint32_t key[3] = { 0 };
+    uint32_t key[4] = { 0 };
     ID3D11SamplerState *o;
     D3D11_SAMPLER_DESC d;
     uint32_t mn = (t->filter >> 16) & 0xFF, mg = (t->filter >> 24) & 0x0F;
@@ -1383,6 +1644,7 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
 
     key[0] = t->addr_u; key[1] = t->addr_v;
     key[2] = (mn == 1 && mg == 1) ? 0 : 1;               /* NEAREST both: point, else linear */
+    key[3] = (uint32_t)s_aniso;                          /* F1 menu: anisotropic filtering */
     o = (ID3D11SamplerState *)cache_get(&s_samp, key, sizeof key);
     if (o) return o;
     for (k = 0; k < 2; k++) {
@@ -1394,9 +1656,10 @@ static ID3D11SamplerState *get_sampler(const Nv2aTexture *t)
         }
     }
     memset(&d, 0, sizeof d);
-    d.Filter = key[2] ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    d.Filter = key[2] ? (s_aniso > 1 ? D3D11_FILTER_ANISOTROPIC : D3D11_FILTER_MIN_MAG_MIP_LINEAR)
+                      : D3D11_FILTER_MIN_MAG_MIP_POINT;
     d.AddressU = am[0]; d.AddressV = am[1]; d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.MaxAnisotropy = 1;
+    d.MaxAnisotropy = (UINT)(key[2] ? s_aniso : 1);
     d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     d.MaxLOD = D3D11_FLOAT32_MAX;
     if (FAILED(ID3D11Device_CreateSamplerState(g.dev, &d, &o))) { logf_("CreateSamplerState failed\n"); return NULL; }
@@ -1440,6 +1703,31 @@ static ID3D11ShaderResourceView *rt_as_texture(const Nv2aTexture *t, RenderTarge
 
 static struct { uint32_t va, w, h; ID3D11Texture2D *dtex; ID3D11DepthStencilView *dsv; } zpool[8];
 static int zpool_n, zpool_want;
+static RenderTarget *s_asp_last;
+
+/* The internal resolution changed: drop every render surface (and the depth buffers they
+ * share); the next draw makes them again at the new scale. */
+static void rt_reset_all(void)
+{
+    int i;
+    for (i = 0; i < g.nrt; i++) {
+        if (g.rt[i].rtv) ID3D11RenderTargetView_Release(g.rt[i].rtv);
+        if (g.rt[i].tex) ID3D11Texture2D_Release(g.rt[i].tex);
+        if (g.rt[i].srv) ID3D11ShaderResourceView_Release(g.rt[i].srv);
+        if (g.rt[i].dsv) ID3D11DepthStencilView_Release(g.rt[i].dsv);
+        if (g.rt[i].dtex) ID3D11Texture2D_Release(g.rt[i].dtex);
+    }
+    g.nrt = 0;
+    for (i = 0; i < zpool_n; i++) {
+        if (zpool[i].dsv) ID3D11DepthStencilView_Release(zpool[i].dsv);
+        if (zpool[i].dtex) ID3D11Texture2D_Release(zpool[i].dtex);
+    }
+    zpool_n = 0;
+    s_asp_last = NULL;
+    s_ztex_flush = 1;
+    s_scale_applied = s_scale;
+    logf_("internal resolution %dx (%dx%d)\n", s_scale, 640 * s_scale, 480 * s_scale);
+}
 
 /* RECOMP_D3D11_ZTEX=1 (2 = also dump): a texture whose guest address is the zeta buffer reads the depth
  * buffer. On the NV2A the zeta surface is ordinary memory: a Z24S8 word (Z << 8 | S) per
@@ -1480,6 +1768,8 @@ static const char k_hlsl_ztex[] =
 "float4 ps_z_abgr(float4 pos : SV_Position) : SV_Target { return zbytes(pos); }\n"
 "float4 ps_z_argb(float4 pos : SV_Position) : SV_Target { float4 b = zbytes(pos); return float4(b.b, b.g, b.r, b.a); }\n";
 
+static int s_ztex_flush;
+
 static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
 {
     static ID3D11VertexShader *vs;
@@ -1496,6 +1786,18 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
     D3D11_VIEWPORT vp;
     ID3D11ShaderResourceView *sv[2];
 
+    if (s_ztex_flush) {                     /* the render targets were remade: drop the old copies */
+        for (i = 0; i < nzc; i++) {
+            if (zc[i].srv) ID3D11ShaderResourceView_Release(zc[i].srv);
+            if (zc[i].dsrv) ID3D11ShaderResourceView_Release(zc[i].dsrv);
+            if (zc[i].ssrv) ID3D11ShaderResourceView_Release(zc[i].ssrv);
+            if (zc[i].rtv) ID3D11RenderTargetView_Release(zc[i].rtv);
+            if (zc[i].ctex) ID3D11Texture2D_Release(zc[i].ctex);
+            if (zc[i].dtex) ID3D11Texture2D_Release(zc[i].dtex);
+        }
+        nzc = 0;
+        s_ztex_flush = 0;
+    }
     if (!ztex_enabled() || init_failed) return NULL;
     if (t->color != 0x3F && t->color != 0x12) return NULL;   /* LIN_A8B8G8R8, LIN_A8R8G8B8 */
     if (t->pitch && t->pitch != t->width * 4) return NULL;
@@ -1543,7 +1845,7 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
             return NULL;
         }
         memset(&td, 0, sizeof td);
-        td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = t->width * (UINT)s_scale; td.Height = t->height * (UINT)s_scale; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
@@ -1570,7 +1872,7 @@ static ID3D11ShaderResourceView *zeta_as_texture(const Nv2aTexture *t)
     ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, NULL, 0);
     ID3D11DeviceContext_RSSetState(g.ctx, NULL);
     vp.TopLeftX = vp.TopLeftY = 0.0f;
-    vp.Width = (float)t->width; vp.Height = (float)t->height;
+    vp.Width = (float)(t->width * (uint32_t)s_scale); vp.Height = (float)(t->height * (uint32_t)s_scale);
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(g.ctx, 1, &vp);
     ID3D11DeviceContext_IASetInputLayout(g.ctx, NULL);
@@ -1621,7 +1923,7 @@ static void ensure_depth(RenderTarget *r, const Nv2aRenderState *rs)
         }
     }
     memset(&td, 0, sizeof td);
-    td.Width = r->w; td.Height = r->h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Width = r->w * (UINT)s_scale; td.Height = r->h * (UINT)s_scale; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -1660,6 +1962,7 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs,
     RenderTarget *r;
 
     if (!init_window_and_device()) return;
+    if (s_scale_applied != s_scale) rt_reset_all();
     r = get_rt(s);
     if (!r) return;
     r->uses++;
@@ -1829,6 +2132,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             nhit++; return;
         }
     }
+    if (s_scale_applied != s_scale) rt_reset_all();
     r = get_rt(s);
     if (!r) return;
     r->uses++;
@@ -1981,7 +2285,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     ID3D11DeviceContext_RSSetState(g.ctx, get_raster(rs, gpu));
     vp.TopLeftX = vp.TopLeftY = 0.0f;
-    vp.Width = (float)r->w; vp.Height = (float)r->h;
+    vp.Width = (float)(r->w * (uint32_t)s_scale); vp.Height = (float)(r->h * (uint32_t)s_scale);
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(g.ctx, 1, &vp);
     if (x && x->gpu) {                    /* the vertex program runs on the GPU */
@@ -2710,7 +3014,7 @@ static void be_flip(void)
             best = r;
     }
     s_asp_last = NULL;
-    if (best && aspect_on() && !s_asp_fail) {
+    if (best && (aspect_on() || s_scale > 1) && !s_asp_fail) {
         s_asp_busy = 1;
         if (g.dump_prefix && g.dump_every && (g.flips % g.dump_every) == 0)
             dump_tex(best->tex, NULL, 0);                 /* the game image, as without the switch */
