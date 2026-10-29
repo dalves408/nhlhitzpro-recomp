@@ -36,7 +36,7 @@ Esc pauses the game (clocks, timers and sound stop) and asks "Do you want to qui
 
 XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
 
-**Settings menu (F1):** pauses the game and lets you change the internal resolution (1x is the Xbox's 640x480; 2x suits a 1080p screen, 3x a 1440p/2K screen, 4x is just under 4K and 5x suits a 4K screen, up to 3200x2400, measured by the height of the 4:3 picture), fullscreen, VSync and anisotropic filtering. Use Up/Down and Left/Right (or the mouse); changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
+**Settings menu (F1):** pauses the game and lets you change the internal resolution (1x is the Xbox's 640x480; 2x is labelled 1080p, 3x 2K and 5x 4K, up to 3200x2400, by the height of the 4:3 picture; 4x sits in between), fullscreen, VSync and anisotropic filtering. Use Up/Down and Left/Right (or the mouse); changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
 
 **Changing the keyboard keys:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu). Pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
 
