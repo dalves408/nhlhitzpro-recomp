@@ -1,0 +1,28 @@
+# Game content: never commit. Users supply their own disc.
+*.iso
+*.xiso
+*.xbe
+/game_files/
+
+# Generated / local output
+/analysis/
+/runtime/
+/native/build/
+/native/src/recomp/gen/
+*.log
+
+# Local tooling
+/.venv/
+__pycache__/
+*.pyc
+
+# Local emulator / capture / dump material: never commit
+/xemu/
+/screenshots/
+scripts/xemu_ramdump*
+*ramdump*.ps1
+*ramdump*.bat
+*.rdc
+*.qcow2
+*.bin
+shadercache/
