@@ -11,14 +11,15 @@ This project contains **no game content**. You need your own copy of the Xbox di
 - Windows 10 or 11, 64-bit
 - A GPU with Direct3D 11 support (any from the last decade)
 - A multi-core CPU (the game's vertex work and audio run on the CPU)
-- About 2 GB of free disk space
+- About 2 GB of free disk space (plus about 1.3 GB for the optional hi-res texture pack)
 - Your own **NHL Hitz Pro (USA)** disc, as an `.iso` / `.xiso` image or as a folder with the game's files (the folder that holds `default.xbe`)
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.4.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.5.exe` and choose where to install.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
-3. Start **NHL Hitz Pro** from the Start menu.
+3. On the **Hi-res texture pack** page, tick the box to add the 4x texture pack (see below). It is optional.
+4. Start **NHL Hitz Pro** from the Start menu.
 
 If the game is already installed, Setup says so and shows the installed version and the new one. A different version only updates the program files after you confirm (no disc needed, game files and saves kept); the same version offers Repair or Quit.
 
@@ -38,11 +39,13 @@ Esc pauses the game (clocks, timers and sound stop) and asks "Do you want to qui
 
 XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
 
-**Settings menu (F1, or hold Back and press Start on controller 1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
+**Settings menu (F1, or hold Back and press Start on controller 1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, **Frame Rate** (30, 60, 120, 144, 240 or 360 fps; the intro movies always run at 60), anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
 
-**Settings program:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu) to set things before you start the game. Its **Video** tab, shown first, has the same options as the F1 menu (render scale, fullscreen, stretch image, VSync, anti-aliasing, anisotropic filter). Its **Controls** tab remaps the keyboard.
+**Settings program:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu) to set things before you start the game. Its **Video** tab, shown first, has the same options as the F1 menu (render scale, fullscreen, stretch image, VSync, frame rate, anti-aliasing, anisotropic filter). Its **Controls** tab remaps the keyboard.
 
 **Changing the keyboard keys** (Controls tab): pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
+
+**Hi-res texture pack (optional):** 1,910 textures redrawn at 4x resolution: the ice, boards and glass, team logos, jerseys and numbers, faces and more. It is a separate 1.27 GB add-on. The game installer's **Hi-res texture pack** page installs it: if `NHLHitzPro-HiRes-Textures-1.exe` is in the same folder as the installer it uses that file, otherwise it offers to download it (the download is checked before use). The add-on can also be run on its own after the game is installed. When Setup runs again later, it checks the installed pack file by file against the current release and offers to update or repair it. The pack lives in `<install folder>\texture_pack`; pictures placed in `%LOCALAPPDATA%\NHLHitzPro\texture_pack` override the same texture. A replacement picture is matched by the first 16 hex characters of its file name (a hash of the original texture's pixels) and can be a PNG or BMP of any size. The pack's textures are sorted into folders (`rink`, `logos`, `jerseys`, `glow`, `other`). The settings program's **Textures** tab has a master switch and one checkbox per kind (greyed out with a download button when no pack is installed), and the F1 menu has a **Hi-res textures** line that turns the whole pack on or off while you play. The 4x pictures are only used at **Render Scale 2x or higher**; at 1x (native) the switch is dark and the original textures are shown.
 
 **Known issues**
 
@@ -79,7 +82,7 @@ cmake -S native -B native/build-release -DNHL_RELEASE=ON
 cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp nhl_import
 ```
 
-The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup). `native/installer/gen_manifest.py` regenerates the list of disc files and the `default.xbe` hash it checks.
+The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup). `native/installer/gen_manifest.py` regenerates the list of disc files and the `default.xbe` hash it checks. The texture pack add-on is built from `native/installer/nhl_hitz_pro_textures.iss`; `gen_pack_manifest.py` writes the pack's file list (`manifest.txt`) and the release data (`pack_release.iss`: file name, size, SHA-256 and download address) that the game installer checks.
 
 ## How it works
 

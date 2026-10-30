@@ -69,6 +69,8 @@ uint32_t xbox_LastFileError(void)
 }
 
 #if defined(_WIN32)
+extern void xbox_vblank_movie(int on);
+static HANDLE s_movie_handle;       /* the open .xmv intro movie, if any */
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
 
@@ -553,6 +555,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
     }
     XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile: %S -> handle=%p", win_path, h);
+    {   /* the intro movies are paced for 60 Hz: the display runs at 60 while one is open */
+        size_t n = wcslen(win_path);
+        if (n > 4 && _wcsicmp(win_path + n - 4, L".xmv") == 0) {
+            s_movie_handle = h;
+            xbox_vblank_movie(1);
+        }
+    }
     return STATUS_SUCCESS;
 }
 
@@ -704,6 +713,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        if (Handle == s_movie_handle) { s_movie_handle = NULL; xbox_vblank_movie(0); }
         vpart_release(Handle);
         overwrite_settle(Handle);
         xbox_dir_context_drop(Handle);

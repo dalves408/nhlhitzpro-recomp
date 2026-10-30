@@ -5,7 +5,9 @@
 ; then compile this script with ISCC.exe. Output: native\installer\Output\NHLHitzPro-Setup-<version>.exe
 ; If the game is already installed (its game files are in place), Setup only updates the program files:
 ; it does not ask for the disc and does not copy the 1.5 GB of game files again.
-#define AppVersion "1.0.4"
+#define AppVersion "1.0.5"
+#include "pack_version.iss"
+#include "pack_release.iss"
 #define BuildDir "..\build-release\Release"
 
 [Setup]
@@ -56,6 +58,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\game_files"
+; the hi-res texture pack (added by its own installer) and that installer's uninstall files
+Type: filesandordirs; Name: "{app}\texture_pack"
+Type: filesandordirs; Name: "{app}\addons"
 
 [Code]
 var
@@ -66,6 +71,17 @@ var
   VerRel: Integer;          { -1: the installed version is older, 0: same, 1: newer than this Setup }
   RepairRadio, QuitRadio: TNewRadioButton;
   QuitNow: Boolean;
+  { hi-res texture pack }
+  PackPage: TWizardPage;
+  PackCheck: TNewCheckBox;
+  PackInfo, PackNote: TNewStaticText;
+  PackDlPage: TDownloadWizardPage;
+  PackState: Integer;       { 0 not installed, 1 installed and every file matches, 2 another version, 3 damaged }
+  PackSource: String;       { the add-on installer found next to this Setup, or '' }
+  PackWanted: Boolean;
+  PackCheckedDir: String;   { the folder whose pack was checked (the result is kept while it stays the same) }
+  PackDeep: Boolean;        { the last check also hashed every file }
+  PackDeepBtn: TNewButton;
 
 { The game files are in place: default.xbe and a few of the largest files, so an install that was
   interrupted halfway is not mistaken for a finished one. }
@@ -209,6 +225,247 @@ begin
   AddLine('Click Update to continue, or Cancel to leave the installed version as it is.', False);
 end;
 
+{ ---- hi-res texture pack (a separate add-on installer, run by this Setup) ---- }
+
+function MB(Bytes: Int64): String;
+begin
+  Result := IntToStr((Bytes + 524288) div 1048576) + ' MB';
+end;
+
+{ The add-on installer, if it sits next to this Setup and has the expected size }
+function FindPackBesideSetup: String;
+var
+  F: String;
+  Size: Int64;
+begin
+  Result := '';
+  F := ExtractFilePath(ExpandConstant('{srcexe}')) + '{#PackFileName}';
+  if FileExists(F) and FileSize64(F, Size) and (Size = {#PackFileSize}) then
+    Result := F;
+end;
+
+{ Compare the installed pack with the manifest of this release: first the manifest itself (is it the current
+  release?), then the size and SHA-256 of every file in it (is it complete and undamaged?). }
+procedure CheckInstalledPack(AppDir: String; Deep: Boolean);
+var
+  Dir, Sum: String;
+  Lines: TArrayOfString;
+  I, P, Q, Bad, N: Integer;
+  Hash, Rel, F: String;
+  Size, Want: Int64;
+begin
+  Dir := AppDir + '\texture_pack';
+  PackState := 0;
+  PackNote.Caption := '';
+  if not FileExists(Dir + '\manifest.txt') then Exit;
+  Sum := GetSHA256OfFile(Dir + '\manifest.txt');
+  if CompareText(Sum, '{#PackManifestSha256}') <> 0 then
+  begin
+    PackState := 2;
+    Exit;
+  end;
+  if not LoadStringsFromFile(Dir + '\manifest.txt', Lines) then
+  begin
+    PackState := 3;
+    Exit;
+  end;
+  Bad := 0; N := GetArrayLength(Lines);
+  for I := 0 to N - 1 do
+  begin
+    if Trim(Lines[I]) = '' then Continue;
+    { <sha256> <size> <relative path> }
+    P := Pos(' ', Lines[I]);
+    Hash := Copy(Lines[I], 1, P - 1);
+    Rel := Copy(Lines[I], P + 1, Length(Lines[I]));
+    Q := Pos(' ', Rel);
+    Want := StrToInt64Def(Copy(Rel, 1, Q - 1), -1);
+    Rel := Copy(Rel, Q + 1, Length(Rel));
+    StringChangeEx(Rel, '/', '\', True);
+    F := Dir + '\' + Rel;
+    { the quick check: the file is there and has the right size; the deep check also hashes it }
+    if not (FileExists(F) and FileSize64(F, Size) and (Size = Want)) then
+      Bad := Bad + 1
+    else if Deep and (CompareText(GetSHA256OfFile(F), Hash) <> 0) then
+      Bad := Bad + 1;
+    if Deep and (I mod 25 = 0) then
+    begin
+      PackInfo.Caption := 'Checking every file of the installed texture pack... ' + IntToStr(I * 100 div N) + '%';
+      PackInfo.Repaint;
+    end;
+  end;
+  PackDeep := Deep;
+  if Bad = 0 then PackState := 1
+  else
+  begin
+    PackState := 3;
+    PackNote.Caption := IntToStr(Bad) + ' of ' + IntToStr(N) + ' files are missing or do not match this release.';
+  end;
+end;
+
+procedure ShowPackPage(Recheck: Boolean);
+var
+  Beside: Boolean;
+begin
+  if Recheck or (PackCheckedDir <> WizardDirValue) then
+  begin
+    PackInfo.Caption := 'Checking the installed texture pack...';
+    PackCheck.Visible := False;
+    PackDeepBtn.Visible := False;
+    PackInfo.Repaint;
+    CheckInstalledPack(WizardDirValue, False);   { quick: files present and the right size }
+    PackCheckedDir := WizardDirValue;
+  end;
+  PackSource := FindPackBesideSetup;
+  Beside := PackSource <> '';
+  PackCheck.Visible := True;
+  case PackState of
+    1:
+      begin
+        if PackDeep then
+          PackInfo.Caption := 'The hi-res texture pack is installed. Every file was checked and matches the current release (pack version {#PackVersion}).'
+        else
+          PackInfo.Caption := 'The hi-res texture pack is installed and complete (pack version {#PackVersion}: every file is present at the right size).';
+        PackCheck.Caption := 'Install it again';
+        PackCheck.Checked := False;
+      end;
+    2:
+      begin
+        PackInfo.Caption := 'A different version of the texture pack is installed. This Setup comes with pack version {#PackVersion}.';
+        PackCheck.Caption := 'Update the hi-res texture pack';
+        PackCheck.Checked := True;
+      end;
+    3:
+      begin
+        PackInfo.Caption := 'The installed texture pack is damaged or incomplete.';
+        PackCheck.Caption := 'Repair the hi-res texture pack';
+        PackCheck.Checked := True;
+      end;
+  else
+  begin
+    PackInfo.Caption := 'Adds 4x sharper textures: the ice and boards, team logos, jerseys and more. About ' +
+      MB({#PackInstalledBytes}) + ' of disk space. The game runs without it.';
+    if Beside then
+    begin
+      PackCheck.Caption := 'Install the hi-res texture pack (found next to this Setup)';
+      PackCheck.Checked := True;
+    end else
+    begin
+      PackCheck.Caption := 'Download and install the hi-res texture pack (' + MB({#PackFileSize}) + ' download)';
+      PackCheck.Checked := False;
+    end;
+  end;
+  end;
+  PackDeepBtn.Visible := (PackState = 1) and not PackDeep;
+  if PackState <> 0 then
+    if Beside then
+      PackNote.Caption := PackNote.Caption + ' The add-on installer next to this Setup will be used.'
+    else
+      PackNote.Caption := PackNote.Caption + ' It will be downloaded (' + MB({#PackFileSize}) + ').';
+  if (PackState = 0) and not Beside then
+    PackNote.Caption := 'The add-on installer ({#PackFileName}) was not found next to this Setup. ' +
+      'Tick the box to download it from the internet; the download is checked before it is used.';
+end;
+
+function PackOnDownloadProgress(const Url, FileName: String; const Progress, ProgressMax: Int64): Boolean;
+begin
+  if ProgressMax > 0 then
+    PackDlPage.SetText('Downloading the hi-res texture pack', MB(Progress) + ' of ' + MB(ProgressMax));
+  Result := True;
+end;
+
+procedure PackDeepClick(Sender: TObject);
+begin
+  PackDeepBtn.Visible := False;
+  PackCheck.Visible := False;
+  CheckInstalledPack(WizardDirValue, True);
+  ShowPackPage(False);
+end;
+
+procedure CreatePackPage;
+begin
+  PackPage := CreateCustomPage(SrcPage.ID, 'Hi-res texture pack (optional)',
+    'Sharper textures for the ice, boards, logos and jerseys.');
+  PackInfo := TNewStaticText.Create(PackPage);
+  PackInfo.Parent := PackPage.Surface;
+  PackInfo.AutoSize := False; PackInfo.WordWrap := True;
+  PackInfo.Left := 0; PackInfo.Top := 0;
+  PackInfo.Width := PackPage.SurfaceWidth; PackInfo.Height := ScaleY(48);
+  PackCheck := TNewCheckBox.Create(PackPage);
+  PackCheck.Parent := PackPage.Surface;
+  PackCheck.Left := 0; PackCheck.Top := PackInfo.Top + PackInfo.Height + ScaleY(8);
+  PackCheck.Width := PackPage.SurfaceWidth; PackCheck.Height := ScaleY(20);
+  PackNote := TNewStaticText.Create(PackPage);
+  PackNote.Parent := PackPage.Surface;
+  PackNote.AutoSize := False; PackNote.WordWrap := True;
+  PackNote.Left := 0; PackNote.Top := PackCheck.Top + PackCheck.Height + ScaleY(12);
+  PackNote.Width := PackPage.SurfaceWidth; PackNote.Height := ScaleY(60);
+  PackDeepBtn := TNewButton.Create(PackPage);
+  PackDeepBtn.Parent := PackPage.Surface;
+  PackDeepBtn.Caption := 'Check every file (slower)';
+  PackDeepBtn.Left := 0; PackDeepBtn.Top := PackNote.Top + ScaleY(70);
+  PackDeepBtn.Width := ScaleX(190);
+  PackDeepBtn.Visible := False;
+  PackDeepBtn.OnClick := @PackDeepClick;
+  PackDlPage := CreateDownloadPage('Downloading the hi-res texture pack', 'This can take several minutes.',
+    @PackOnDownloadProgress);
+end;
+
+{ Free space for the download (temp drive) and the installed pack (game drive) }
+function PackSpaceOk: Boolean;
+var
+  Free, Total: Int64;
+begin
+  Result := True;
+  if GetSpaceOnDisk64(ExtractFileDrive(WizardDirValue), Free, Total) and (Free < {#PackInstalledBytes} + 200000000) then
+  begin
+    MsgBox('There is not enough free space on ' + ExtractFileDrive(WizardDirValue) + ' for the texture pack (about ' +
+      MB({#PackInstalledBytes} + 200000000) + ' needed). Free some space or untick the pack.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  if (PackSource = '') and
+     GetSpaceOnDisk64(ExtractFileDrive(ExpandConstant('{tmp}')), Free, Total) and (Free < {#PackFileSize} + 200000000) then
+  begin
+    MsgBox('There is not enough free space on ' + ExtractFileDrive(ExpandConstant('{tmp}')) +
+      ' for the download (about ' + MB({#PackFileSize} + 200000000) + ' needed). Free some space or untick the pack.',
+      mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+{ Make the add-on installer available: next to this Setup (checked against the release) or downloaded }
+function PreparePackInstaller: Boolean;
+var
+  Url: String;
+begin
+  Result := True;
+  if PackSource <> '' then
+  begin
+    WizardForm.StatusLabel.Caption := 'Checking the add-on installer...';
+    if CompareText(GetSHA256OfFile(PackSource), '{#PackFileSha256}') = 0 then Exit;
+    MsgBox('The add-on installer next to this Setup is damaged (its checksum does not match). It will be downloaded instead.',
+      mbInformation, MB_OK);
+    PackSource := '';
+  end;
+  Url := ExpandConstant('{param:PACKURL|{#PackUrl}}');
+  PackDlPage.Clear;
+  PackDlPage.Add(Url, '{#PackFileName}', '{#PackFileSha256}');
+  PackDlPage.Show;
+  try
+    try
+      PackDlPage.Download;
+    except
+      if PackDlPage.AbortedByUser then
+        Log('Texture pack download cancelled')
+      else
+        MsgBox('The texture pack could not be downloaded:' + #13#10 + GetExceptionMessage, mbError, MB_OK);
+      Result := False;
+    end;
+  finally
+    PackDlPage.Hide;
+  end;
+end;
+
 procedure BrowseFile(Sender: TObject);
 var
   F: String;
@@ -267,10 +524,15 @@ begin
   B2.Left := B1.Left + B1.Width + 8; B2.Top := B1.Top;
   B2.Width := ScaleX(110);
   B2.OnClick := @BrowseFolder;
+  CreatePackPage;
+  { silent installs: setup /SILENT /HIRES=yes installs the texture pack too }
+  PackSource := FindPackBesideSetup;
+  PackWanted := CompareText(ExpandConstant('{param:HIRES|no}'), 'yes') = 0;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
+  if CurPageID = PackPage.ID then ShowPackPage(False);
   if UpdateMode and (CurPageID = UpdatePage.ID) then
   begin
     if VerRel = 0 then RadioClick(nil) else WizardForm.NextButton.Caption := 'Update';
@@ -290,8 +552,15 @@ end;
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo,
   MemoGroupInfo, MemoTasksInfo: String): String;
 var
-  S: String;
+  S, Pk: String;
 begin
+  Pk := '';
+  if PackWanted then
+  begin
+    Pk := NewLine + NewLine + 'Hi-res texture pack:' + NewLine + Space;
+    if PackSource <> '' then Pk := Pk + 'installed from the add-on installer next to this Setup'
+    else Pk := Pk + 'downloaded (' + MB({#PackFileSize}) + ') and installed';
+  end;
   if UpdateMode and GameFilesPresent(WizardDirValue) then
   begin
     if VerRel = 0 then
@@ -305,13 +574,13 @@ begin
     S := S + NewLine + Space + WizardDirValue + NewLine + NewLine +
          'Only the program files are replaced. Your game files, saves and settings are kept.';
     if MemoTasksInfo <> '' then S := S + NewLine + NewLine + MemoTasksInfo;
-    Result := S;
+    Result := S + Pk;
   end else
   begin
     S := '';
     if MemoDirInfo <> '' then S := S + MemoDirInfo + NewLine + NewLine;
     if MemoTasksInfo <> '' then S := S + MemoTasksInfo + NewLine;
-    Result := S;
+    Result := S + Pk;
   end;
 end;
 
@@ -319,6 +588,20 @@ end;
 function ShouldSkipPage(PageID: Integer): Boolean;
 begin
   Result := (PageID = SrcPage.ID) and GameFilesPresent(WizardDirValue);
+  { An installed pack that matches this release (quick check) needs no question and no download: the page is skipped }
+  if PageID = PackPage.ID then
+  begin
+    if PackCheckedDir <> WizardDirValue then
+    begin
+      CheckInstalledPack(WizardDirValue, False);
+      PackCheckedDir := WizardDirValue;
+    end;
+    if PackState = 1 then
+    begin
+      PackWanted := False;
+      Result := True;
+    end;
+  end;
 end;
 
 procedure CancelButtonClick(CurPageID: Integer; var Cancel, Confirm: Boolean);
@@ -336,6 +619,20 @@ begin
     Result := False;
     Exit;
   end;
+  if CurPageID = PackPage.ID then
+  begin
+    PackWanted := PackCheck.Checked;
+    if PackWanted and not PackSpaceOk then Result := False;
+  end;
+  if (CurPageID = wpReady) and PackWanted and not WizardSilent then
+    if not PreparePackInstaller then
+    begin
+      if MsgBox('Continue installing without the hi-res texture pack? You can add it later with the add-on installer (' +
+         '{#PackFileName}).', mbConfirmation, MB_YESNO) = IDYES then
+        PackWanted := False
+      else
+        Result := False;
+    end;
   if CurPageID = SrcPage.ID then
     if (Trim(SrcEdit.Text) = '') or
        not (FileExists(Trim(SrcEdit.Text)) or DirExists(Trim(SrcEdit.Text))) then
@@ -343,6 +640,41 @@ begin
       MsgBox('Select an existing disc image or folder.', mbError, MB_OK);
       Result := False;
     end;
+end;
+
+{ Run the add-on installer for the pack, from next to this Setup or from the download }
+procedure InstallPack;
+var
+  Exe: String;
+  Code: Integer;
+begin
+  if WizardSilent then              { a silent install does not reinstall a pack that already matches }
+  begin
+    CheckInstalledPack(ExpandConstant('{app}'), False);
+    if PackState = 1 then
+    begin
+      Log('The texture pack is installed and matches this release; skipped');
+      Exit;
+    end;
+  end;
+  Exe := PackSource;
+  if Exe = '' then Exe := ExpandConstant('{tmp}\{#PackFileName}');
+  if WizardSilent and (PackSource <> '') and (CompareText(GetSHA256OfFile(Exe), '{#PackFileSha256}') <> 0) then
+  begin
+    Log('The add-on installer next to Setup does not match this release; texture pack skipped');
+    Exit;
+  end;
+  if not FileExists(Exe) then
+  begin
+    Log('No add-on installer available; texture pack skipped');
+    Exit;
+  end;
+  WizardForm.StatusLabel.Caption := 'Installing the hi-res texture pack...';
+  WizardForm.FilenameLabel.Caption := '';
+  if not Exec(Exe, '/SILENT /SUPPRESSMSGBOXES /NORESTART /DIR="' + ExpandConstant('{app}') + '"', '',
+              SW_SHOWNORMAL, ewWaitUntilTerminated, Code) or (Code <> 0) then
+    MsgBox('The hi-res texture pack could not be installed. The game itself is installed and works without it. ' +
+      'Run ' + '{#PackFileName}' + ' later to add the pack.', mbError, MB_OK);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -375,4 +707,6 @@ begin
         'Run Setup again and select a correct disc image or folder.', mbError, MB_OK);
     end;
   end;
+  if (CurStep = ssPostInstall) and PackWanted then
+    InstallPack;
 end;

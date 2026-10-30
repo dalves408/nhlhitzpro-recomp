@@ -34,7 +34,21 @@ typedef struct {
     float    fog_px, fog_py, pad1;
 } GvsConsts;
 
-static int gvs_init(void)
+/* With the graphics thread, the executor's probe and the thread's draws both look programs up. */
+static CRITICAL_SECTION s_gvs_cs;
+static volatile LONG s_gvs_cs_ready;
+static void gvs_lock(int on)
+{
+    if (!s_async) return;
+    if (!s_gvs_cs_ready) {
+        static volatile LONG once;
+        if (InterlockedCompareExchange(&once, 1, 0) == 0) { InitializeCriticalSection(&s_gvs_cs); MemoryBarrier(); s_gvs_cs_ready = 1; }
+        else while (!s_gvs_cs_ready) YieldProcessor();
+    }
+    if (on) EnterCriticalSection(&s_gvs_cs); else LeaveCriticalSection(&s_gvs_cs);
+}
+
+static int gvs_init_u(void)
 {
     D3D11_BUFFER_DESC bd;
     D3D11_SHADER_RESOURCE_VIEW_DESC sd;
@@ -144,8 +158,23 @@ static int gvs_async_on(void)
     return on;
 }
 
+static int gvs_init(void)
+{
+    int r;
+    gvs_lock(1); r = gvs_init_u(); gvs_lock(0);
+    return r;
+}
+
 /* Find or compile the shader of `e`'s program; NULL if it cannot be drawn on the GPU. */
+static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify);
 static GvsSpec *gvs_get(const Nv2aGpuVs *e, int want_verify)
+{
+    GvsSpec *r;
+    gvs_lock(1); r = gvs_get_u(e, want_verify); gvs_lock(0);
+    return r;
+}
+
+static GvsSpec *gvs_get_u(const Nv2aGpuVs *e, int want_verify)
 {
     GvsSpec *sp = NULL;
     uint32_t i;
@@ -255,7 +284,7 @@ int nv2a_gpuvs_probe(const Nv2aGpuVs *e)
 
     if (env < 0)
         env = getenv("RECOMP_D3D11_GPUVS") != NULL;
-    if (!env || !init_window_and_device() || !gvs_init())
+    if (!env || (s_async && !s_dev_ready) || !init_window_and_device() || !gvs_init())
         return 0;
     return gvs_get(e, e->verify) != NULL;
 }

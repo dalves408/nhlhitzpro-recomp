@@ -28,6 +28,8 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>     /* texture replacement pack (WIC decodes the PNG/BMP files) */
+#include <ctype.h>
 #include <pdh.h>          /* title-bar GPU %: types only; pdh.dll is loaded at run time */
 #include <stdarg.h>
 #include <stdint.h>
@@ -36,6 +38,15 @@
 #include <string.h>
 #include "nv2a_backend.h"
 #include "nv2a_pbx.h"        /* project: combiner state for batches that have it */
+
+/* Graphics thread (RECOMP_GFX_THREAD, on by default): the executor only records each draw, clear, flip and
+ * blit; this back end's own thread replays them. s_async says so; while a recorded draw is replayed the
+ * batch's extra state is s_wx (the executor's copy is overwritten as soon as it moves on). */
+static int s_async;
+static volatile LONG s_dev_ready;     /* the graphics thread has made the window and device */
+static const Nv2aBatchExt *s_wx;
+static const Nv2aBatchExt *pbx_cur(void) { return s_async ? s_wx : (nv2a_pbx_current)(); }
+#define nv2a_pbx_current() pbx_cur()
 
 /* keyboard.h (toolkit input library): keys reach the title through these. */
 extern void xbox_InputKeySet(int vk, int down);
@@ -184,12 +195,21 @@ static int s_set_active, s_set_sel, s_set_armed;
 extern volatile int nhl_input_block;           /* usb_gamepad.c override: the game sees neutral pads */
 static int s_pad_valid, s_unblock_wait;   /* controller 1 driving the overlay / waiting for its buttons to be released */
 static DWORD s_unblock_t;
-static RECT s_set_row[8];
+static RECT s_set_row[10];
 static int s_ztex_flush;          /* zeta_as_texture: drop its cached copies */
 static void rt_reset_all(void);
 static int s_msaa = 1;            /* F1 anti-aliasing: 1 (off), 2, 4, 8 samples */
 static int s_msaa_applied = 1;
 static int s_stretch;             /* F1 "Stretch image": fill the window instead of the 4:3 shape */
+static int s_fpsi;                /* F1 "Frame Rate": index into SET_FPS_HZ */
+static int s_hires = 1;           /* F1 "Hi-res textures" (settings.ini [textures] enabled) */
+static int s_cat_on[5] = { 1, 1, 1, 1, 1 };   /* texture pack folders rink, logos, jerseys, glow, other (config.exe Textures tab) */
+static int s_tex_flush;           /* re-check every cached texture against the pack */
+static unsigned s_pack_hits[5];   /* replacements loaded per kind (log) */
+static void pack_init(void);
+static int pack_installed(void);
+static const unsigned SET_FPS_HZ[6] = { 30, 60, 120, 144, 240, 360 };   /* the last is "uncapped": more only costs CPU (1000 measured slower) */
+extern void xbox_set_vblank_hz(unsigned hz);   /* kernel_bridge.c override: the display rate the game sees */
 
 /* The most samples (up to the chosen number) the card supports for both the colour and depth formats. */
 static int msaa_effective(void)
@@ -209,8 +229,8 @@ static int msaa_effective(void)
     return cache[want];
 }
 
-#define SET_ITEMS 8
-enum { IT_RES, IT_FS, IT_STRETCH, IT_VSYNC, IT_AA, IT_ANISO, IT_CLOSE, IT_QUIT };
+#define SET_ITEMS 10
+enum { IT_RES, IT_FS, IT_STRETCH, IT_VSYNC, IT_FPS, IT_AA, IT_ANISO, IT_HIRES, IT_CLOSE, IT_QUIT };
 
 static int cfg_path(char *out, size_t n)
 {
@@ -237,6 +257,20 @@ static void cfg_put(const char *key, int v)
     WritePrivateProfileStringA("display", key, val, path);
 }
 
+static int cfg_get_s(const char *sec, const char *key, int def)
+{
+    char path[MAX_PATH];
+    return cfg_path(path, sizeof path) ? (int)GetPrivateProfileIntA(sec, key, def, path) : def;
+}
+
+static void cfg_put_s(const char *sec, const char *key, int v)
+{
+    char path[MAX_PATH], val[16];
+    if (!cfg_path(path, sizeof path)) return;
+    snprintf(val, sizeof val, "%d", v);
+    WritePrivateProfileStringA(sec, key, val, path);
+}
+
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 static void settings_load(void)
@@ -250,28 +284,51 @@ static void settings_load(void)
     s_msaa = a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
     s_msaa_applied = s_msaa;
     s_stretch = cfg_get("stretch", 0) != 0;
+    {   /* the game's frame rate is the rate of the display it is told it has; saved as that number of hertz */
+        int hz = cfg_get("frame_rate", 60), i, best = 0, bd = 1 << 30;
+        for (i = 0; i < 6; i++)
+            if (abs((int)SET_FPS_HZ[i] - hz) < bd) { bd = abs((int)SET_FPS_HZ[i] - hz); best = i; }
+        s_fpsi = best;
+        if (SET_FPS_HZ[best] != 60) xbox_set_vblank_hz(SET_FPS_HZ[best]);
+    }
     a = cfg_get("anisotropy", 1);
     s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
     if (!getenv("RECOMP_D3D11_VSYNC"))
         g.vsync = cfg_get("vsync", 0) != 0;
+    {   /* hi-res texture pack: the master switch and one switch per kind of texture */
+        static const char *const k[5] = { "rink", "logos", "jerseys", "glow", "other" };
+        int i;
+        s_hires = cfg_get_s("textures", "enabled", 1) != 0;
+        for (i = 0; i < 5; i++) s_cat_on[i] = cfg_get_s("textures", k[i], 1) != 0;
+        pack_init();
+    }
 }
 
 static const char *const SET_LABEL[SET_ITEMS] = {
-    "Render Scale", "Fullscreen", "Stretch image", "VSync", "Anti-aliasing", "Anisotropic filter", "Close menu", "Quit game" };
+    "Render Scale", "Fullscreen", "Stretch image", "VSync", "Frame Rate", "Anti-aliasing", "Anisotropic filter", "Hi-res textures", "Close menu", "Quit game" };
 static const char *const SET_RES[5] = {
     "1x  640x480 (Native)", "2x  1280x960", "3x  1920x1440",
     "4x  2560x1920", "5x  3200x2400" };
 static const char *const SET_OFFON[2] = { "Off", "On" };
 static const char *const SET_ANISO[5] = { "Off", "2x", "4x", "8x", "16x" };
 static const char *const SET_STRETCH[2] = { "Off (4:3)", "On (fills window)" };
+static const char *const SET_FPS[6] = { "30", "60 (original)", "120", "144", "240", "Uncapped (up to 360)" };
 static const char *const SET_AA[4] = { "Off", "2x MSAA", "4x MSAA", "8x MSAA" };
+
+/* Hi-res textures cannot be used without a pack, or at Render Scale 1x (native): that row is dark and skipped */
+static int set_disabled(int i)
+{
+    return i == IT_HIRES && (!pack_installed() || s_scale < 2);
+}
 
 static int set_count(int i)
 {
     switch (i) {
     case IT_RES: case IT_ANISO: return 5;
+    case IT_FPS: return 6;
     case IT_AA: return 4;
     case IT_FS: case IT_STRETCH: case IT_VSYNC: return 2;
+    case IT_HIRES: return set_disabled(IT_HIRES) ? 0 : 2;
     }
     return 0;
 }
@@ -283,6 +340,8 @@ static int set_get(int i)
     case IT_FS: return s_fs ? 1 : 0;
     case IT_STRETCH: return s_stretch ? 1 : 0;
     case IT_VSYNC: return g.vsync ? 1 : 0;
+    case IT_HIRES: return s_hires ? 1 : 0;
+    case IT_FPS: return s_fpsi;
     case IT_AA: return s_msaa >= 8 ? 3 : s_msaa >= 4 ? 2 : s_msaa >= 2 ? 1 : 0;
     case IT_ANISO: return s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : s_aniso >= 2 ? 1 : 0;
     }
@@ -295,9 +354,11 @@ static const char *set_text(int i)
     switch (i) {
     case IT_RES: return SET_RES[v];
     case IT_STRETCH: return SET_STRETCH[v];
+    case IT_FPS: return SET_FPS[v];
     case IT_AA: return SET_AA[v];
     case IT_ANISO: return SET_ANISO[v];
     case IT_FS: case IT_VSYNC: return SET_OFFON[v];
+    case IT_HIRES: return !pack_installed() ? "Not installed" : s_scale < 2 ? "Needs 2x or higher" : SET_OFFON[v];
     }
     return "";
 }
@@ -307,15 +368,19 @@ static void aspect_on_size(void);
 static void set_put(int i, int v)
 {
     switch (i) {
-    case IT_RES: s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;   /* applied by the next draw */
+    case IT_RES:
+        if ((s_scale >= 2) != (v + 1 >= 2)) s_tex_flush = 1;      /* the pack starts or stops being used */
+        s_scale = v + 1; cfg_put("resolution_scale", s_scale); break;   /* applied by the next draw */
     case IT_FS: user_toggle_fullscreen(g.hwnd); break;
     case IT_STRETCH:
         s_stretch = v; cfg_put("stretch", v);
         if (!s_stretch && !s_fs) aspect_on_size();      /* back to the 4:3 window shape */
         break;
     case IT_VSYNC: g.vsync = v; cfg_put("vsync", v); break;
+    case IT_FPS: s_fpsi = v; cfg_put("frame_rate", (int)SET_FPS_HZ[v]); xbox_set_vblank_hz(SET_FPS_HZ[v]); break;
     case IT_AA: s_msaa = v ? 1 << v : 1; cfg_put("msaa", s_msaa); break;       /* applied by the next draw */
     case IT_ANISO: s_aniso = v ? 1 << v : 1; cfg_put("anisotropy", s_aniso); break;
+    case IT_HIRES: s_hires = v; cfg_put_s("textures", "enabled", v); s_tex_flush = 1; break;   /* cached textures are re-made */
     }
 }
 
@@ -356,7 +421,7 @@ static void set_draw(void)
     rh = ch * 7 / 100; if (rh < 22) rh = 22;
     dw = rh * 17;
     if (dw > cw * 95 / 100) { dw = cw * 95 / 100; rh = dw / 17; }
-    dh = rh * 113 / 10;
+    dh = rh * 133 / 10;
     dx = (cw - dw) / 2; dy = (ch - dh) / 2;
     SetRect(&rr, dx, dy, dx + dw, dy + dh);
     br = CreateSolidBrush(RGB(255, 122, 0)); FillRect(mdc, &rr, br); DeleteObject(br);
@@ -377,9 +442,9 @@ static void set_draw(void)
         y = dy + rh * 14 / 10 + i * rh;
         x = dx + rh / 3;
         SetRect(&s_set_row[i], x, y, dx + dw - rh / 3, y + rh * 82 / 100);
-        br = CreateSolidBrush(sel ? RGB(255, 122, 0) : RGB(52, 60, 78));   /* the quit prompt's buttons */
+        br = CreateSolidBrush(sel ? RGB(255, 122, 0) : set_disabled(i) ? RGB(28, 34, 46) : RGB(52, 60, 78));   /* the quit prompt's buttons */
         FillRect(mdc, &s_set_row[i], br); DeleteObject(br);
-        SetTextColor(mdc, sel ? RGB(10, 10, 14) : RGB(200, 210, 225));
+        SetTextColor(mdc, sel ? RGB(10, 10, 14) : set_disabled(i) ? RGB(92, 100, 114) : RGB(200, 210, 225));
         rr = s_set_row[i]; rr.left += rh / 3;
         DrawTextA(mdc, SET_LABEL[i], -1, &rr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         rr = s_set_row[i]; rr.right -= rh / 3;
@@ -387,6 +452,8 @@ static void set_draw(void)
             snprintf(buf, sizeof buf, "<  %s  >", set_text(i));
         else if (i == IT_QUIT && s_set_armed)
             snprintf(buf, sizeof buf, "press again to quit");
+        else if (i == IT_HIRES)
+            snprintf(buf, sizeof buf, "%s", set_text(i));
         else
             buf[0] = 0;
         DrawTextA(mdc, buf, -1, &rr, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -442,7 +509,8 @@ static int set_key(WPARAM w, LPARAM l, int down)
     if (!down) return 1;
     if (w == VK_ESCAPE || w == VK_F1) { if (!repeat) quit_close(); return 1; }
     if (w == VK_UP || w == VK_DOWN) {
-        s_set_sel = (s_set_sel + (w == VK_UP ? SET_ITEMS - 1 : 1)) % SET_ITEMS;
+        do s_set_sel = (s_set_sel + (w == VK_UP ? SET_ITEMS - 1 : 1)) % SET_ITEMS;
+        while (set_disabled(s_set_sel));
         s_set_armed = 0;
         set_draw();
     } else if (w == VK_LEFT) set_change(s_set_sel, -1);
@@ -515,8 +583,8 @@ static void quit_draw(void)
     SetRect(&s_q_btn[0], dx + dw / 2 - bw - dw / 25, by, dx + dw / 2 - dw / 25, by + bh);
     SetRect(&s_q_btn[1], dx + dw / 2 + dw / 25, by, dx + dw / 2 + dw / 25 + bw, by + bh);
     SetBkMode(mdc, TRANSPARENT);
-    ft = CreateFontA(-(dh * 17 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Impact");
-    fb = CreateFontA(-(dh * 15 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Impact");
+    ft = CreateFontA(-(dh * 17 / 100), 0, 0, 0, FW_MEDIUM, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Bahnschrift SemiCondensed");
+    fb = CreateFontA(-(dh * 15 / 100), 0, 0, 0, FW_MEDIUM, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Bahnschrift SemiCondensed");
     oldf = SelectObject(mdc, ft);
     SetTextColor(mdc, RGB(255, 255, 255));
     SetRect(&dr, dx, dy + dh * 12 / 100, dx + dw, dy + dh * 50 / 100);
@@ -1532,6 +1600,7 @@ typedef struct {
     ID3D11ShaderResourceView *srv;
     uint32_t last_use;
     uint8_t mips;                    /* made with a mip chain (anisotropic filtering on) */
+    uint8_t repl;                    /* the GPU texture is a replacement-pack image (a different size) */
 } TexEntry;
 
 static TexEntry s_tex[MAX_TEX];
@@ -1654,12 +1723,184 @@ static int td_match(const char *list, uint32_t off)
     return 0;
 }
 
+
+/* Hash of the decoded picture (size and pixels). The hash of the texture's memory region is not stable from run
+ * to run (it can reach into neighbouring memory), so dump file names and replacement packs use this one:
+ * CRC-32 in the high half, Adler-32 in the low half, both over the width and height followed by the BGRA pixels. */
+static uint64_t px_hash(uint32_t w, uint32_t hh, const uint32_t *px)
+{
+    static uint32_t tab[256]; static int init;
+    uint32_t crc = 0xFFFFFFFFu, a = 1, b = 0;
+    uint8_t wh[8];
+    const uint8_t *p = (const uint8_t *)px;
+    size_t n = (size_t)w * hh * 4, i, k;
+    if (!init) {
+        for (i = 0; i < 256; i++) { uint32_t c = (uint32_t)i; int j; for (j = 0; j < 8; j++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1; tab[i] = c; }
+        init = 1;
+    }
+    memcpy(wh, &w, 4); memcpy(wh + 4, &hh, 4);
+    for (i = 0; i < 8; i++) { crc = tab[(crc ^ wh[i]) & 0xFF] ^ (crc >> 8); a += wh[i]; b += a; }
+    a %= 65521u; b %= 65521u;
+    for (i = 0; i < n; ) {
+        size_t m = n - i < 5552 ? n - i : 5552;
+        for (k = 0; k < m; k++) { uint8_t c = p[i + k]; crc = tab[(crc ^ c) & 0xFF] ^ (crc >> 8); a += c; b += a; }
+        a %= 65521u; b %= 65521u; i += m;
+    }
+    return ((uint64_t)(crc ^ 0xFFFFFFFFu) << 32) | ((b << 16) | a);
+}
+
+/* ---- texture replacement pack ----
+ * Files named <16 hex digits of the texture's content hash>*.png|bmp (as written by RECOMP_TEXDUMP_ALL) in the
+ * folder RECOMP_TEXPACK, or %LOCALAPPDATA%\NHLHitzPro\texture_pack, are used in place of the decoded texture.
+ * The replacement may be any size; the game's texture coordinates are scaled by the original size, so
+ * a 4x image simply samples sharper. Pack textures always get a mip chain. */
+typedef struct { uint64_t hash; uint8_t cat; char path[MAX_PATH]; } PackFile;   /* cat: 0 rink, 1 logos, 2 jerseys, 3 glow, 4 other */
+static PackFile *s_pack;
+static int s_npack, s_pack_init;
+static uint32_t *s_pack_px;
+static size_t s_pack_cap;
+
+static void pack_scan(const char *dir, int depth, int cat)
+{
+    WIN32_FIND_DATAA fd;
+    char pat[MAX_PATH + 8];
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        char full[MAX_PATH];
+        size_t n = strlen(fd.cFileName);
+        if (fd.cFileName[0] == '.') continue;
+        snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (depth < 3) {
+                int c = cat;
+                if (depth == 0) {      /* the pack's folders are its kinds of texture */
+                    static const char *const nm[5] = { "rink", "logos", "jerseys", "glow", "other" };
+                    int k;
+                    c = 4;
+                    for (k = 0; k < 5; k++) if (!_stricmp(fd.cFileName, nm[k])) c = k;
+                }
+                pack_scan(full, depth + 1, c);
+            }
+            continue;
+        }
+        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".bmp"))) {
+            char hx[17];
+            int i, ok = 1, dup = 0;
+            uint64_t v;
+            memcpy(hx, fd.cFileName, 16); hx[16] = 0;
+            for (i = 0; i < 16; i++) if (!isxdigit((unsigned char)hx[i])) ok = 0;
+            if (!ok) continue;
+            v = _strtoui64(hx, NULL, 16);
+            for (i = 0; i < s_npack; i++) if (s_pack[i].hash == v) { dup = 1; break; }
+            if (dup) continue;
+            if ((s_npack & 255) == 0) s_pack = (PackFile *)realloc(s_pack, sizeof(PackFile) * (size_t)(s_npack + 256));
+            if (!s_pack) { s_npack = 0; break; }
+            s_pack[s_npack].hash = v;
+            s_pack[s_npack].cat = (uint8_t)cat;
+            snprintf(s_pack[s_npack].path, MAX_PATH, "%s", full);
+            s_npack++;
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+
+/* Decode a PNG/BMP file to 32-bit BGRA with Windows Imaging Component; returns pixels in s_pack_px. */
+static const uint32_t *pack_load(const char *path, uint32_t *w, uint32_t *hh)
+{
+    IWICImagingFactory *fac = NULL;
+    IWICBitmapDecoder *dec = NULL;
+    IWICBitmapFrameDecode *fr = NULL;
+    IWICFormatConverter *cv = NULL;
+    WCHAR wp[MAX_PATH];
+    UINT W = 0, H = 0;
+    const uint32_t *ret = NULL;
+
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    MultiByteToWideChar(CP_ACP, 0, path, -1, wp, MAX_PATH);
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (void **)&fac))) return NULL;
+    if (FAILED(IWICImagingFactory_CreateDecoderFromFilename(fac, wp, NULL, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) goto out;
+    if (FAILED(IWICBitmapDecoder_GetFrame(dec, 0, &fr))) goto out;
+    if (FAILED(IWICBitmapFrameDecode_GetSize(fr, &W, &H)) || !W || !H || W > 16384 || H > 16384) goto out;
+    if (FAILED(IWICImagingFactory_CreateFormatConverter(fac, &cv))) goto out;
+    if (FAILED(IWICFormatConverter_Initialize(cv, (IWICBitmapSource *)fr, &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom))) goto out;
+    if ((size_t)W * H > s_pack_cap) {
+        free(s_pack_px);
+        s_pack_px = (uint32_t *)malloc((size_t)W * H * 4);
+        s_pack_cap = s_pack_px ? (size_t)W * H : 0;
+        if (!s_pack_px) goto out;
+    }
+    if (FAILED(IWICFormatConverter_CopyPixels(cv, NULL, W * 4, W * H * 4, (BYTE *)s_pack_px))) goto out;
+    *w = W; *hh = H; ret = s_pack_px;
+out:
+    if (cv) IWICFormatConverter_Release(cv);
+    if (fr) IWICBitmapFrameDecode_Release(fr);
+    if (dec) IWICBitmapDecoder_Release(dec);
+    IWICImagingFactory_Release(fac);
+    return ret;
+}
+
+static void pack_init(void)
+{
+    char dir[MAX_PATH];
+    const char *e = getenv("RECOMP_TEXPACK");
+    if (s_pack_init) return;
+    s_pack_init = 1;
+    if (e && *e) {
+        snprintf(dir, sizeof dir, "%s", e);
+        pack_scan(dir, 0, 4);
+    } else {
+        /* The user's folder first (a file found there wins), then the pack the installer put
+           next to the exe. */
+        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof dir - 32)) {
+            strcat(dir, "\\NHLHitzPro\\texture_pack");
+            pack_scan(dir, 0, 4);
+        }
+        if (GetModuleFileNameA(NULL, dir, sizeof dir - 32)) {
+            char *sl = strrchr(dir, '\\');
+            if (sl) { strcpy(sl, "\\texture_pack"); pack_scan(dir, 0, 4); }
+        }
+    }
+    if (s_npack) fprintf(stderr, "[D3D11] texture pack: %d replacement(s) (last folder %s)\n", s_npack, dir);
+}
+
+static int pack_installed(void)
+{
+    pack_init();
+    return s_npack > 0;
+}
+
+static const uint32_t *pack_lookup(uint64_t hash, uint32_t *w, uint32_t *hh)
+{
+    int i;
+    pack_init();
+    if (!hash || !s_npack || !s_hires || s_scale < 2) return NULL;     /* the 4x pictures need Render Scale 2x or more */
+    for (i = 0; i < s_npack; i++)
+        if (s_pack[i].hash == hash) {
+            const uint32_t *r;
+            if (!s_cat_on[s_pack[i].cat]) return NULL;
+            r = pack_load(s_pack[i].path, w, hh);
+            if (r) s_pack_hits[s_pack[i].cat]++;
+            return r;
+        }
+    return NULL;
+}
+
 static TexEntry *get_texture(const Nv2aTexture *t)
 {
     TexEntry *e = NULL;
     int i;
-    uint64_t h = 0, t0;
+    if (s_tex_flush) {                    /* F1 Hi-res textures switched: every cached texture is checked again */
+        s_tex_flush = 0;
+        for (i = 0; i < s_ntex; i++) { s_tex[i].hash = ~0ull; s_tex[i].sample = ~0ull; s_tex[i].full_us = 0; }
+    }
+    uint64_t h = 0, t0, ph = 0;
     size_t span, need;
+    const uint32_t *rp;
+    uint32_t rw_ = 0, rh_ = 0;
+    int remake = 0;
 
     if (!t->width || !t->height || t->width > 4096 || t->height > 4096) return NULL;
     for (i = 0; i < s_ntex; i++)
@@ -1704,6 +1945,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     }
     s_dec_us += qpc_us() - t0;
     s_dec_n++;
+    ph = px_hash(t->width, t->height, s_scratch);
     {
         static const char *td_off; static int td_init, td_n;
         if (!td_init) { td_init = 1; td_off = getenv("RECOMP_D3D11_TEXDUMP"); }
@@ -1723,12 +1965,69 @@ static TexEntry *get_texture(const Nv2aTexture *t)
             td_n++;
         }
     }
+    {   /* RECOMP_TEXDUMP_ALL=<dir>: write every distinct decoded texture once, as a 32-bit BMP with its alpha,
+         * named <content hash>_<w>x<h>_f<format>_fl<first flip>.bmp (for texture replacement packs) */
+        static const char *dir; static int init; static uint64_t seen[65536]; static int nseen;
+        if (!init) {
+            init = 1; dir = getenv("RECOMP_TEXDUMP_ALL");
+            if (dir) {   /* textures already in the folder (earlier runs) are not written again */
+                WIN32_FIND_DATAA fd; char pat[MAX_PATH + 8]; HANDLE fh;
+                snprintf(pat, sizeof pat, "%s/*.bmp", dir);
+                fh = FindFirstFileA(pat, &fd);
+                if (fh != INVALID_HANDLE_VALUE) {
+                    do {
+                        char hx[17]; int i, ok = strlen(fd.cFileName) > 16;
+                        for (i = 0; ok && i < 16; i++) if (!isxdigit((unsigned char)fd.cFileName[i])) ok = 0;
+                        if (!ok || nseen >= 65536) continue;
+                        memcpy(hx, fd.cFileName, 16); hx[16] = 0;
+                        seen[nseen++] = _strtoui64(hx, NULL, 16);
+                    } while (FindNextFileA(fh, &fd));
+                    FindClose(fh);
+                }
+            }
+            fprintf(stderr, "[TEXDUMP] dir=%s (%d already there)\n", dir ? dir : "(none)", nseen);
+        }
+        if (dir && ph) {
+            int k, dup = 0;
+            for (k = 0; k < nseen; k++) if (seen[k] == ph) { dup = 1; break; }
+            if (!dup && nseen < 65536) {
+                char pth[640];
+                FILE *f;
+                seen[nseen++] = ph;
+                snprintf(pth, sizeof pth, "%s/%016llX_%ux%u_f%02X_fl%u.bmp", dir, (unsigned long long)ph, t->width, t->height, t->color, (unsigned)g.flips);
+                f = fopen(pth, "wb");
+                if (f) {
+                    uint8_t hdr[54] = { 'B', 'M' };
+                    uint32_t isz = t->width * t->height * 4, v;
+                    int32_t nh = -(int32_t)t->height;
+                    v = 54 + isz; memcpy(hdr + 2, &v, 4);
+                    v = 54; memcpy(hdr + 10, &v, 4);
+                    v = 40; memcpy(hdr + 14, &v, 4);
+                    memcpy(hdr + 18, &t->width, 4); memcpy(hdr + 22, &nh, 4);
+                    hdr[26] = 1; hdr[28] = 32; memcpy(hdr + 34, &isz, 4);
+                    fwrite(hdr, 1, 54, f);
+                    fwrite(s_scratch, 4, (size_t)t->width * t->height, f);
+                    fclose(f);
+                }
+            }
+        }
+    }
 
-    if (!e) {
+    rp = pack_lookup(ph, &rw_, &rh_);
+    if (e && (rp || e->repl)) {                          /* size changes: remake the GPU texture */
+        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+        if (e->tex) ID3D11Texture2D_Release(e->tex);
+        memset(e, 0, sizeof *e);
+        remake = 1;
+    }
+    if (!e || remake) {
         D3D11_TEXTURE2D_DESC td;
         D3D11_SUBRESOURCE_DATA sd;
         HRESULT hr;
-        if (s_ntex < MAX_TEX) e = &s_tex[s_ntex++];
+        const uint32_t *up = rp ? rp : s_scratch;
+        uint32_t uw = rp ? rw_ : t->width, uh = rp ? rh_ : t->height;
+        if (remake) { /* keep the slot */ }
+        else if (s_ntex < MAX_TEX) e = &s_tex[s_ntex++];
         else {                                           /* evict the least recently used */
             int w = 0;
             for (i = 1; i < MAX_TEX; i++) if (s_tex[i].last_use < s_tex[w].last_use) w = i;
@@ -1738,20 +2037,20 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
         memset(e, 0, sizeof *e);
         memset(&td, 0, sizeof td);
-        td.Width = t->width; td.Height = t->height; td.MipLevels = 1; td.ArraySize = 1;
+        td.Width = uw; td.Height = uh; td.MipLevels = 1; td.ArraySize = 1;
         td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        sd.pSysMem = s_scratch; sd.SysMemPitch = t->width * 4; sd.SysMemSlicePitch = 0;
-        if (tex_want_mips() && t->width >= 4 && t->height >= 4) {
+        sd.pSysMem = up; sd.SysMemPitch = uw * 4; sd.SysMemSlicePitch = 0;
+        if ((tex_want_mips() || rp) && uw >= 4 && uh >= 4) {
             td.MipLevels = 0;                                    /* the full chain */
             td.BindFlags |= D3D11_BIND_RENDER_TARGET;            /* GenerateMips needs it */
             td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
             hr = ID3D11Device_CreateTexture2D(g.dev, &td, NULL, &e->tex);
             if (SUCCEEDED(hr)) {
                 ID3D11DeviceContext_UpdateSubresource(g.ctx, (ID3D11Resource *)e->tex, 0, NULL,
-                                                      s_scratch, t->width * 4, 0);
+                                                      up, uw * 4, 0);
                 hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)e->tex, NULL, &e->srv);
                 if (SUCCEEDED(hr)) {
                     ID3D11DeviceContext_GenerateMips(g.ctx, e->srv);
@@ -1773,6 +2072,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
         e->off = t->offset; e->color = t->color; e->w = t->width; e->h = t->height;
         e->pitch = t->pitch;
+        e->repl = rp != NULL;
         if (g.log && s_ntex <= 40)
             logf_("new texture off 0x%08X fmt 0x%X %ux%u pitch %u\n", t->offset, t->color,
                   t->width, t->height, t->pitch);
@@ -3383,6 +3683,7 @@ static void be_flip(void)
               g.flips, (GetTickCount() - g.t0) / 1000.0, g.rc_draws, s_nspec, s_spec_fail, (unsigned long long)s_spec_ms, g.draws, g.tris, s_ntex,
               (unsigned long long)s_dec_n, (unsigned long long)s_up_n,
               (unsigned long long)(s_dec_us / 1000), (unsigned long long)(s_hash_us / 1000));
+        logf_("pack_hits rink=%u logos=%u jerseys=%u glow=%u other=%u (hires=%d)\n", s_pack_hits[0], s_pack_hits[1], s_pack_hits[2], s_pack_hits[3], s_pack_hits[4], s_hires);
     if (g.log && s_gstate > 0 && (g.flips % 300) == 0)
         logf_("gpuvs: draws=%lu verts=%lu MB=%lu programs=%u failed=%u compile_ms=%u mapfail=%lu\n",
               s_gdraws, s_gverts, s_gbytes >> 20, s_ngspec, s_gspec_fail, s_gspec_ms, s_gmapfail);
@@ -3424,6 +3725,210 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
 
+/* ---- the graphics thread ----
+ * A single-producer single-consumer ring of records. The executor thread parses the push buffer and copies
+ * everything a draw reads (state, vertices or the GPU vertex block, combiner, texture description) into the
+ * ring; the graphics thread replays the records through be_clear/be_draw/be_flip/be_blit unchanged. Textures
+ * are still read from guest memory at replay time, which is safe because a flip waits for the ring to drain:
+ * the guest never gets to rewrite a texture while a frame that uses it is still queued. */
+enum { Q_PAD, Q_CLEAR, Q_DRAW, Q_FLIP, Q_BLIT };
+#define Q_BYTES (24u << 20)
+typedef struct { uint32_t type, size; } QHdr;
+typedef struct { QHdr h; Nv2aSurface s; Nv2aRenderState rs; uint32_t flags, argb, zst; } QClear;
+typedef struct { QHdr h; uint32_t a, b, c, d; } QBlit;
+typedef struct {
+    QHdr h; Nv2aSurface s; Nv2aRenderState rs; Nv2aTexture tex; Nv2aBatchExt x; Nv2aCombiner rc; Nv2aGpuVs gv;
+    uint32_t count, has_tex, has_x, has_rc, has_gv, nverts, next, block_bytes;
+} QDraw;
+
+static uint8_t *q_buf;
+static volatile LONG64 q_head, q_tail;          /* bytes since start; head is the producer's, tail the consumer's */
+static volatile LONG q_cons_sleep, q_prod_sleep;
+static volatile LONG q_flips_posted, q_flips_done;
+static HANDLE q_ev_data, q_ev_space, q_ev_done;
+
+static size_t q_al(size_t n) { return (n + 15u) & ~(size_t)15u; }
+
+/* A sleeping consumer is woken when a worthwhile amount is queued (a syscall per record cost the executor
+ * a tenth of its time), and always at the end of a frame or when the ring is full; it also wakes by itself
+ * after a millisecond. */
+static void q_wake_consumer(int force)
+{
+    if (q_cons_sleep && (force || q_head - q_tail >= (64 << 10))) SetEvent(q_ev_data);
+}
+
+/* Room for n bytes at the producer's head, without wrapping inside the record. */
+static uint8_t *q_reserve(size_t n)
+{
+    for (;;) {
+        LONG64 head = q_head, tail = q_tail;
+        size_t off = (size_t)(head % Q_BYTES);
+        size_t pad = (off + n > Q_BYTES) ? Q_BYTES - off : 0;
+        if ((size_t)(Q_BYTES - (head - tail)) >= pad + n) {
+            if (pad) {
+                QHdr *p = (QHdr *)(q_buf + off);
+                p->type = Q_PAD; p->size = (uint32_t)pad;
+                InterlockedExchange64(&q_head, head + (LONG64)pad);
+                q_wake_consumer(1);
+                off = 0;
+            }
+            return q_buf + off;
+        }
+        q_wake_consumer(1);
+        InterlockedExchange(&q_prod_sleep, 1);
+        if ((size_t)(Q_BYTES - (q_head - q_tail)) < pad + n)
+            WaitForSingleObject(q_ev_space, 1);
+        InterlockedExchange(&q_prod_sleep, 0);
+    }
+}
+
+static void q_commit(size_t n, int force)
+{
+    InterlockedExchange64(&q_head, q_head + (LONG64)n);
+    q_wake_consumer(force);
+}
+
+static void ab_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags, uint32_t argb, uint32_t zst)
+{
+    QClear *r = (QClear *)q_reserve(q_al(sizeof *r));
+    r->h.type = Q_CLEAR; r->h.size = (uint32_t)q_al(sizeof *r);
+    r->s = *s; r->rs = *rs; r->flags = flags; r->argb = argb; r->zst = zst;
+    q_commit(r->h.size, 0);
+}
+
+static void ab_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    const Nv2aBatchExt *x = (nv2a_pbx_current)();
+    int gpu = x && x->gpu && x->gpu->block;
+    size_t vb = 0, eb = 0, bb = 0, total;
+    QDraw *r;
+    uint8_t *p;
+
+    if (!b || !b->count || !b->state) return;
+    if (!gpu && !b->vertices) return;
+    if (!gpu) {
+        vb = q_al((size_t)b->count * sizeof(Nv2aVertex));
+        if (x && x->ext) eb = q_al((size_t)b->count * sizeof(Nv2aVertexExt));
+    } else
+        bb = q_al(x->gpu->block_bytes);
+    total = q_al(sizeof *r) + vb + eb + bb;
+    r = (QDraw *)q_reserve(total);
+    p = (uint8_t *)r + q_al(sizeof *r);
+    r->h.type = Q_DRAW; r->h.size = (uint32_t)total;
+    r->s = *s; r->rs = *b->state; r->count = b->count;
+    r->has_tex = b->texture != NULL;
+    if (r->has_tex) r->tex = *b->texture;
+    r->has_x = x != NULL; r->has_rc = 0; r->has_gv = gpu; r->nverts = (uint32_t)(vb != 0); r->next = (uint32_t)(eb != 0);
+    r->block_bytes = 0;
+    if (x) {
+        r->x = *x;
+        if (x->rc) { r->rc = *x->rc; r->has_rc = 1; }
+    }
+    if (vb) { memcpy(p, b->vertices, (size_t)b->count * sizeof(Nv2aVertex)); p += vb; }
+    if (eb) { memcpy(p, x->ext, (size_t)b->count * sizeof(Nv2aVertexExt)); p += eb; }
+    if (gpu) {   /* the program text stays behind: the probe already made the shader, and the replay finds it by hash */
+        const Nv2aGpuVs *g0 = x->gpu;
+        r->gv.nslots = 0; r->gv.hash = g0->hash; r->gv.input_mask = g0->input_mask; r->gv.nidx = g0->nidx;
+        r->gv.aa_sx = g0->aa_sx; r->gv.aa_sy = g0->aa_sy; r->gv.fog_mode = g0->fog_mode;
+        r->gv.fog_px = g0->fog_px; r->gv.fog_py = g0->fog_py; r->gv.block_bytes = g0->block_bytes;
+        r->block_bytes = g0->block_bytes;
+        memcpy(p, g0->block, g0->block_bytes);
+    }
+    q_commit(total, 0);
+}
+
+static void ab_flip(void)
+{
+    QHdr *h = (QHdr *)q_reserve(16);
+    LONG want = InterlockedIncrement(&q_flips_posted);
+    h->type = Q_FLIP; h->size = 16;
+    q_commit(16, 1);
+    while ((LONG)(q_flips_done - want) < 0)
+        WaitForSingleObject(q_ev_done, 1);
+}
+
+static void ab_blit(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    QBlit *r = (QBlit *)q_reserve(q_al(sizeof *r));
+    r->h.type = Q_BLIT; r->h.size = (uint32_t)q_al(sizeof *r);
+    r->a = a; r->b = b; r->c = c; r->d = d;
+    q_commit(r->h.size, 1);
+}
+
+static void be_blit(uint32_t src_va, uint32_t dst_va, uint32_t w, uint32_t h);
+
+static void q_replay_draw(QDraw *r)
+{
+    Nv2aBatch b;
+    uint8_t *p = (uint8_t *)r + q_al(sizeof *r);
+
+    memset(&b, 0, sizeof b);
+    b.count = r->count; b.state = &r->rs; b.texture = r->has_tex ? &r->tex : NULL;
+    if (r->nverts) { b.vertices = (const Nv2aVertex *)p; p += q_al((size_t)r->count * sizeof(Nv2aVertex)); }
+    if (r->has_x) {
+        r->x.ext = NULL; r->x.rc = r->has_rc ? &r->rc : NULL; r->x.gpu = NULL;
+        if (r->next) { r->x.ext = (const Nv2aVertexExt *)p; p += q_al((size_t)r->count * sizeof(Nv2aVertexExt)); }
+        if (r->has_gv) { r->gv.block = p; r->gv.verify_out = NULL; r->gv.verify = 0; r->x.gpu = &r->gv; }
+        s_wx = &r->x;
+    } else
+        s_wx = NULL;
+    be_draw(&r->s, &b);
+    s_wx = NULL;
+}
+
+static DWORD WINAPI gfx_thread_main(LPVOID unused)
+{
+    int spin = 0;
+    (void)unused;
+    init_window_and_device();
+    MemoryBarrier();
+    InterlockedExchange(&s_dev_ready, 1);
+    for (;;) {
+        LONG64 tail = q_tail, head = q_head;
+        QHdr *h;
+        if (tail == head) {
+            if (++spin < 20000) { YieldProcessor(); continue; }
+            InterlockedExchange(&q_cons_sleep, 1);
+            if (q_head == q_tail) WaitForSingleObject(q_ev_data, 1);
+            InterlockedExchange(&q_cons_sleep, 0);
+            spin = 0;
+            continue;
+        }
+        spin = 0;
+        h = (QHdr *)(q_buf + (size_t)(tail % Q_BYTES));
+        switch (h->type) {
+        case Q_CLEAR: { QClear *c = (QClear *)h; be_clear(&c->s, &c->rs, c->flags, c->argb, c->zst); } break;
+        case Q_DRAW:  q_replay_draw((QDraw *)h); break;
+        case Q_BLIT:  { QBlit *c = (QBlit *)h; be_blit(c->a, c->b, c->c, c->d); } break;
+        case Q_FLIP:
+            be_flip();
+            InterlockedIncrement(&q_flips_done);
+            SetEvent(q_ev_done);
+            break;
+        default: break;
+        }
+        InterlockedExchange64(&q_tail, tail + (LONG64)h->size);
+        if (q_prod_sleep) SetEvent(q_ev_space);
+    }
+    return 0;
+}
+
+static const Nv2aBackend s_backend_async = { ab_clear, ab_draw, ab_flip };
+
+static int gfx_thread_start(void)
+{
+    const char *e = getenv("RECOMP_GFX_THREAD");
+    if ((e && e[0] == '0') || getenv("RECOMP_GPUVS_VERIFY")) return 0;
+    q_buf = (uint8_t *)VirtualAlloc(NULL, Q_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    q_ev_data = CreateEventA(NULL, FALSE, FALSE, NULL);
+    q_ev_space = CreateEventA(NULL, FALSE, FALSE, NULL);
+    q_ev_done = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (!q_buf || !q_ev_data || !q_ev_space || !q_ev_done) return 0;
+    s_async = 1;
+    if (!CreateThread(NULL, 0, gfx_thread_main, NULL, 0, NULL)) { s_async = 0; return 0; }
+    return 1;
+}
+
 /* Image blit of a whole render surface into a texture's address (RECOMP_NV_BLIT=1): keep
  * a GPU copy as a render surface with the destination's address, so a draw that samples
  * that texture finds it (rt_as_texture) instead of the never-written guest bytes. */
@@ -3454,6 +3959,12 @@ static void be_blit(uint32_t src_va, uint32_t dst_va, uint32_t w, uint32_t h)
 /* Called from main.c when RECOMP_D3D11=1. */
 void backend_d3d11_register(void)
 {
+    if (gfx_thread_start()) {
+        nv2a_backend_register(&s_backend_async);
+        nv2a_blit_register(ab_blit);
+        fprintf(stderr, "[D3D11] back end registered (graphics thread)\n");
+        return;
+    }
     nv2a_backend_register(&s_backend);
     nv2a_blit_register(be_blit);
     fprintf(stderr, "[D3D11] back end registered (software rasteriser off)\n");

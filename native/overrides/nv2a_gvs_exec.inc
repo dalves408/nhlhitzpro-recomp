@@ -233,8 +233,7 @@ static int gvs_try(void)
         desc[a * 4 + 2] = at->type | (at->size < 4 ? at->size : 4u) << 8;
         desc[a * 4 + 3] = 0;
     }
-    for (i = 0; i < NV2A_VSH_CONSTANTS; i++)
-        memcpy(s_gvs_blk + GVS_OFF_CONST + i * 16u, nv2a_vsh_constant(i), 16);
+    memcpy(s_gvs_blk + GVS_OFF_CONST, nv2a_vsh_constant(0), NV2A_VSH_CONSTANTS * 16u);   /* one contiguous table */
 
     /* triangle-list index array, in the CPU path's assembly order */
     ib = (uint32_t *)(s_gvs_blk + GVS_OFF_IDX);

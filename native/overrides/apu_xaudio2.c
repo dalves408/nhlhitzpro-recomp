@@ -101,6 +101,8 @@ int xa2_init(void)
         fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
         goto fail;
     }
+    if (getenv("RECOMP_AUDIO_MUTE"))     /* unattended runs (texture dumps): no sound */
+        g_xa2_master->lpVtbl->SetVolume(g_xa2_master, 0.0f, 0);
 
     wfx.wFormatTag      = WAVE_FORMAT_PCM;
     wfx.nChannels       = XA2_CHANNELS;

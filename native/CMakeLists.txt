@@ -48,7 +48,7 @@ add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
 # Project-local runtime diagnostics; preserve the pinned toolkit checkout.
 get_target_property(kernel_sources xbox_kernel SOURCES)
-list(REMOVE_ITEM kernel_sources xbox_memory_layout.c nv2a_vsh_interp.c nv2a_combiner.c nv2a_pb_exec.c kernel_file.c kernel_path.c kernel_hal.c)
+list(REMOVE_ITEM kernel_sources xbox_memory_layout.c nv2a_vsh_interp.c nv2a_combiner.c nv2a_pb_exec.c nv2a_pb_scan.c kernel_file.c kernel_path.c kernel_hal.c kernel_bridge.c)
 set_property(TARGET xbox_kernel PROPERTY SOURCES "${kernel_sources}")
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/xbox_memory_layout.c")
 # Project-local copy of the NV2A vertex-program interpreter (predecoded slots + RECOMP_VSH_PROFILE).
@@ -57,10 +57,13 @@ target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_v
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_combiner.c")
 # Project-local copy of the push-buffer executor (configurable raster pool threshold, RECOMP_RASTER_MT_MIN).
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_pb_exec.c")
+target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_pb_scan.c")
 # Project-local copy of kernel_file.c: NtReadFile failure logged with its Win32 error and retried in 64 KB pieces (disc-error screen).
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_file.c")
 # Project-local copy of kernel_path.c: no Partition0..5.img files are created (kernel_file.c emulates the partition devices in memory).
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_path.c")
+# Project-local copy of kernel_bridge.c: the emulated display rate (vblank) is adjustable (frame rate option).
+target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_bridge.c")
 # Project-local copy of kernel_hal.c: guest clocks that can be paused (ESC quit overlay).
 target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_hal.c")
 
@@ -140,7 +143,7 @@ set_property(TARGET nhl_import PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
 # config.exe: the player's settings program, installed next to the game (keyboard remapper for now).
 add_executable(nhl_config WIN32 config/config.c resources/config.rc)
-target_link_libraries(nhl_config PRIVATE comctl32 user32 gdi32)
+target_link_libraries(nhl_config PRIVATE comctl32 user32 gdi32 shell32)
 set_target_properties(nhl_config PROPERTIES OUTPUT_NAME config)
 set_property(TARGET nhl_config PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
@@ -159,6 +162,9 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
+    windowscodecs
+    ole32
+    uuid
     d3dcompiler
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
