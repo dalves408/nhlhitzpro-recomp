@@ -635,6 +635,24 @@ static void set_open(void)
     quit_open();
 }
 
+/* Hold Back and press Start on controller 1: the settings menu (like F1). Called once per frame while no
+ * overlay is open. The game never sees that Start (usb_gamepad.c hides Start while Back is held). */
+static void pad_open_poll(void)
+{
+    static WORD prev;
+    NhlPadState st;
+    WORD b;
+    if (s_q_active) return;
+    if (XInputGetState(0, &st) != 0) { prev = 0; return; }
+    b = st.buttons;
+    if ((b & 0x0020) && (b & 0x0010) && !(prev & 0x0010)) {
+        prev = b;
+        set_open();
+        return;
+    }
+    prev = b;
+}
+
 /* Per frame: follow the game window when it moves or is resized. */
 static void quit_tick(void)
 {
@@ -642,6 +660,11 @@ static void quit_tick(void)
     POINT o = { 0, 0 };
     if (!s_q_active || !g.hwnd) return;
     if (IsIconic(g.hwnd)) return;
+    if (s_q_hwnd && !IsWindowVisible(s_q_hwnd)) {      /* hidden behind our back: show it again, on top, redrawn */
+        ShowWindow(s_q_hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(s_q_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        s_q_cw = 0;                                    /* forces the redraw below */
+    }
     GetClientRect(g.hwnd, &cr);
     ClientToScreen(g.hwnd, &o);
     if (cr.right != s_q_cw || cr.bottom != s_q_ch || o.x != s_q_ox || o.y != s_q_oy) quit_draw();
@@ -2955,8 +2978,18 @@ static void save_fullscreen_setting(int fs) { (void)fs; }
 /* F11 or Alt+Enter: switch, and remember the choice. */
 static void user_toggle_fullscreen(HWND h)
 {
+    static DWORD last;
+    DWORD now = GetTickCount();
+    if (now - last < 400) return;          /* a switch still settling: ignore the extra press */
+    last = now;
     toggle_fullscreen(h);
     save_fullscreen_setting(s_fs);
+    if (s_q_active && s_q_hwnd) {          /* an open overlay is shown again over the new window */
+        ShowWindow(s_q_hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(s_q_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        s_q_cw = 0;
+        quit_draw();
+    }
 }
 
 /* RECOMP_ASPECT_4_3, windowed: the window itself keeps a 4:3 client area, so there are no
@@ -3343,6 +3376,7 @@ static void be_flip(void)
     quit_tick();
     /* Paused: the flip does not return, so the game stops here until the overlay closes. */
     pad_unblock_tick();
+    pad_open_poll();
     while (s_q_active) { Sleep(8); pump_messages(); quit_tick(); pad_overlay_poll(); }
     if (g.log && (g.flips % 300) == 0)
         logf_("flips=%u t=%.1fs rcdraws=%u specs=%u specfail=%u spec_ms=%llu draws=%u tris=%u textures=%d decodes=%llu uploads=%llu decode_ms=%llu hash_ms=%llu\n",

@@ -16,7 +16,7 @@ This project contains **no game content**. You need your own copy of the Xbox di
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.3.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.4.exe` and choose where to install.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
 3. Start **NHL Hitz Pro** from the Start menu.
 
@@ -38,7 +38,7 @@ Esc pauses the game (clocks, timers and sound stop) and asks "Do you want to qui
 
 XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
 
-**Settings menu (F1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
+**Settings menu (F1, or hold Back and press Start on controller 1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
 
 **Settings program:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu) to set things before you start the game. Its **Video** tab, shown first, has the same options as the F1 menu (render scale, fullscreen, stretch image, VSync, anti-aliasing, anisotropic filter). Its **Controls** tab remaps the keyboard.
 

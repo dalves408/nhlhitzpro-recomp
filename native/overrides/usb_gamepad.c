@@ -577,7 +577,13 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         out[1] = 20;
         return 20;
     }
-    return usb_gamepad_report_real(pad, out, max);
+    {
+        int n = usb_gamepad_report_real(pad, out, max);
+        /* Back + Start on controller 1 opens the settings menu (backend_d3d11.c): that Start is not the game's. */
+        if (pad == 0 && n >= 3 && (out[2] & 0x20))
+            out[2] &= (uint8_t)~0x10;
+        return n;
+    }
 }
 
 static int usb_gamepad_report_real(int pad, uint8_t *out, int max)
