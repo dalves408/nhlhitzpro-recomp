@@ -191,6 +191,8 @@ static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
  * Front-End method dispatch
  * ============================================================ */
 
+static void vp_pages_forget(uint32_t v);
+
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 {
     unsigned int slot;
@@ -210,6 +212,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        vp_pages_forget(selected_handle);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -321,6 +324,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        vp_pages_forget(argument & NV1BA0_PIO_VOICE_OFF_HANDLE);
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -620,6 +624,39 @@ static hwaddr get_data_ptr(hwaddr sge_base, unsigned int max_sge, uint32_t addr)
         ldl_le_phys(address_space_memory, sge_base + entry * 4 * 2);
     return prd_address + addr % TARGET_PAGE_SIZE;
 }
+
+/* PROJECT OVERRIDE (NHL Hitz Pro): a voice keeps the meaning a physical page had when it first
+ * read it after it was turned on.
+ *
+ * One physical page number can name two pages here: a window page the contiguous allocator
+ * handed out (DirectSound's own buffers) and a heap page a title named through
+ * MmGetPhysicalAddress. mcpx_apu_phys() lets the heap page win. A voice that DirectSound keeps
+ * looping over its silent window buffer then started reading the title's heap data as soon as
+ * the heap page was named: full-scale noise, a 32-sample buzz that never stopped (exhibition,
+ * after changing teams). A title names its heap pages before it starts the voice that plays
+ * them, so deciding once per page after VOICE_ON keeps both cases right. */
+struct VpPage { uint32_t pg; uint8_t *base; };
+static struct VpPage s_vpg[MCPX_HW_MAX_VOICES][16];
+
+static void vp_pages_forget(uint32_t v)
+{
+    if (v < MCPX_HW_MAX_VOICES)
+        memset(s_vpg[v], 0, sizeof s_vpg[v]);
+}
+
+static uint8_t *vp_phys(uint32_t v, hwaddr addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu, pg = a >> 12;
+    struct VpPage *e = &s_vpg[v][pg & 15];
+    if (!e->base || e->pg != pg) {
+        e->pg = pg;
+        e->base = mcpx_apu_phys((hwaddr)pg << 12);
+    }
+    return e->base + (a & 0xFFFu);
+}
+static uint8_t  vp_ldub(uint32_t v, hwaddr a) { return *(uint8_t *)vp_phys(v, a); }
+static uint16_t vp_lduw(uint32_t v, hwaddr a) { return *(uint16_t *)vp_phys(v, a); }
+static uint32_t vp_ldl(uint32_t v, hwaddr a)  { return *(uint32_t *)vp_phys(v, a); }
 
 /* ============================================================
  * Envelope processing
@@ -1233,7 +1270,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
+                    memcpy(adpcm_block, vp_phys(v, addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -1241,8 +1278,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                          word_index < (9 * samples_per_block); word_index++) {
                         hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
                                                    0xFFFFFFFF, linear_addr);
-                        adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
+                        adpcm_block[word_index] = vp_ldl(v, addr);
                         linear_addr += 4;
                     }
                 }
@@ -1272,19 +1308,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(address_space_memory, addr);
+                    ival = vp_ldub(v, addr);
                     fval = uint8_to_float((uint8_t)(ival & 0xff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(address_space_memory, addr);
+                    ival = vp_lduw(v, addr);
                     fval = int16_to_float((int16_t)(ival & 0xffff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = vp_ldl(v, addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = vp_ldl(v, addr);
                     fval = int32_to_float(ival);
                     break;
                 default:

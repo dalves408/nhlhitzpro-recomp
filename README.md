@@ -16,7 +16,7 @@ This project contains **no game content**. You need your own copy of the Xbox di
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.5.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.6.exe` and choose where to install.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
 3. On the **Hi-res texture pack** page, tick the box to add the 4x texture pack (see below). It is optional.
 4. Start **NHL Hitz Pro** from the Start menu.

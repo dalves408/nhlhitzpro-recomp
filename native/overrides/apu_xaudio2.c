@@ -191,6 +191,12 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
+    {   /* RECOMP_AUDIO_DUMP=<file>: every sample handed over, raw 48 kHz stereo 16-bit, to find audio faults */
+        static FILE *dump; static int dump_init;
+        if (!dump_init) { const char *e = getenv("RECOMP_AUDIO_DUMP"); dump_init = 1; if (e && *e) dump = fopen(e, "wb"); }
+        if (dump) fwrite(samples, XA2_CHANNELS * sizeof(int16_t), (size_t)num_samples, dump);
+    }
+
     while (num_samples > 0) {
         idx = g_xa2_next_buf;
         n = XA2_BUF_SAMPLES - g_xa2_fill;
