@@ -7,7 +7,7 @@
 ; it does not ask for the disc and does not copy the 1.5 GB of game files again.
 ; ISCC /DAppVersion=... /DBuildDir=... /DOutSuffix=-debug /DDebugBuild=1 build a local debug installer (see collect_debug.ps1)
 #ifndef AppVersion
-#define AppVersion "1.0.7"
+#define AppVersion "1.0.8"
 #endif
 #ifndef OutSuffix
 #define OutSuffix ""
