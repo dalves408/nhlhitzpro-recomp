@@ -24,6 +24,17 @@ if(NHL_RELEASE AND MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
+# Debug build for a player's PC (use with NHL_RELEASE=ON): the game logs to %LOCALAPPDATA%/NHLHitzPro/debug, writes a
+# full-memory dump when it crashes or hangs, logs controller input and keeps a PDB beside the exe (src/debug_report.c).
+option(NHL_DEBUGLOG "Self-monitoring debug build (log, crash and hang dumps, input log)" OFF)
+set(NHL_DEBUG_TAG "debug" CACHE STRING "Build tag printed in the debug log header")
+if(NHL_DEBUGLOG AND NOT NHL_RELEASE)
+    message(FATAL_ERROR "NHL_DEBUGLOG is the debug flavour of the player build: configure with -DNHL_RELEASE=ON too, in its own build directory (see DEBUG-BUILD.md)")
+endif()
+if(NHL_DEBUGLOG AND MSVC)
+    add_compile_options(/Zi)
+endif()
+
 # Common definitions
 add_compile_definitions(
     WIN32_LEAN_AND_MEAN
@@ -130,6 +141,9 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
+if(NHL_DEBUGLOG)
+    list(APPEND GAME_SOURCES src/debug_report.c)
+endif()
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
@@ -183,8 +197,20 @@ if(NHL_RELEASE)
     target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/kernel_thunks.c")
     target_compile_definitions(xbox_kernel PRIVATE NHL_RELEASE=1)
     if(MSVC)
-        target_link_options(${PROJECT_NAME} PRIVATE /DEBUG:NONE)
+        if(NHL_DEBUGLOG)
+            target_link_options(${PROJECT_NAME} PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+        else()
+            target_link_options(${PROJECT_NAME} PRIVATE /DEBUG:NONE)
+        endif()
     endif()
+endif()
+if(NHL_DEBUGLOG)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_DEBUGLOG=1)
+    target_compile_definitions(xbox_kernel PRIVATE NHL_DEBUGLOG=1)
+    target_link_libraries(${PROJECT_NAME} PRIVATE psapi)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nhl_debug_tag.h" "#define NHL_DEBUG_TAG \"${NHL_DEBUG_TAG}\"
+")
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files

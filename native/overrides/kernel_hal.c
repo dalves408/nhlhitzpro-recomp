@@ -1252,6 +1252,13 @@ NTSTATUS __stdcall xbox_KeRestoreFloatingPointState(PVOID FloatingPointState)
  * recompilation, we log the error and terminate the process.
  * ============================================================================ */
 
+#ifdef NHL_DEBUGLOG
+extern void nhl_debug_note_exit(const char *why);
+#define NHL_NOTE_EXIT(w) nhl_debug_note_exit(w)
+#else
+#define NHL_NOTE_EXIT(w) ((void)0)
+#endif
+
 VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
@@ -1265,6 +1272,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    NHL_NOTE_EXIT("KeBugCheck: the game stopped itself");
     ExitProcess(BugCheckCode);
 }
 
@@ -1287,6 +1295,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     /* ExitProcess skips atexit. Guest code calls this, never from inside
      * the report's lock, so the summary's list write may take it. */
     xbox_missing_summary("bugcheck");
+    NHL_NOTE_EXIT("KeBugCheck: the game stopped itself");
     ExitProcess(BugCheckCode);
 }
 
@@ -1335,6 +1344,7 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
     /* stderr too: the kernel log file is rewritten on every run, so a title
      * that ends itself otherwise leaves no trace in the run's own log. */
     fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
+    NHL_NOTE_EXIT("HalReturnToFirmware: the game asked to return to the dashboard");
     ExitProcess(0);
 }
 
