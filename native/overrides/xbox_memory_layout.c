@@ -25,6 +25,14 @@ extern unsigned int xbox_tick_ms(void);   /* kernel_hal.c override: GetTickCount
 #include "guest_vmem.h"
 #include "kernel_missing.h"
 #include "nv2a_flip_hold.h"
+#include "xbox_host.h"
+#ifdef NHL_X86
+#define Rip Eip       /* the 32-bit CONTEXT names it Eip (watch_veh, diagnostics) */
+void xbox_x86_init(void *ram, size_t ram_size);
+void xbox_x86_map(uint32_t guest_base, size_t size, void *host);
+void xbox_x86_alias(uint32_t guest_dst, size_t size, uint32_t guest_src);
+void *xbox_x86_commit_region(uint32_t guest_base, size_t size);
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +61,13 @@ extern unsigned int xbox_tick_ms(void);   /* kernel_hal.c override: GetTickCount
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+/* Host address of a guest address: 64-bit builds add the one constant; the 32-bit build (NHL_X86) looks the piece up in the
+ * translation table, which is what reaches the contiguous window and the apertures. */
+#ifdef NHL_X86
+#define XB_HOSTV(va) XBOX_HOST(va)
+#else
+#define XB_HOSTV(va) ((uintptr_t)(va) + g_memory_offset)
+#endif
 
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
@@ -799,6 +814,9 @@ extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up *
  * address far above it alias into a device range. */
 static int mmio_fault_va(uintptr_t fault, uint32_t *va)
 {
+#ifdef NHL_X86
+    return xbox_host_to_va(fault, va);        /* 32-bit: the piece table names the guest window a host address is in */
+#else
     uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
     uint64_t rel = (uint64_t)fault - (uint64_t)base;
 
@@ -806,6 +824,7 @@ static int mmio_fault_va(uintptr_t fault, uint32_t *va)
         return 0;
     *va = (uint32_t)rel;
     return 1;
+#endif
 }
 
 #if defined(_WIN32)
@@ -970,7 +989,7 @@ static void poke_tick(void)
             continue;
         {
             volatile uint32_t *w = (volatile uint32_t *)
-                ((uintptr_t)g_poke[i].va + g_memory_offset);
+                XB_HOSTV(g_poke[i].va);
             if (*w != g_poke[i].value)
                 *w = g_poke[i].value;
         }
@@ -989,7 +1008,7 @@ static void dsp_ack_tick(void)
             continue;
         {
             volatile uint32_t *w = (volatile uint32_t *)
-                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
+                XB_HOSTV(g_dsp_ack[i]);
             if (*w)
                 *w = 0;
         }
@@ -1113,18 +1132,15 @@ static void counter_mirrors_tick(void)
 
         if (!fence_readable(g_counter_mirrors[i].device_ptr_va, 4))
             continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_counter_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
+        dev = *(volatile uint32_t *)XB_HOSTV(g_counter_mirrors[i].device_ptr_va);
         if (!fence_readable(dev + g_counter_mirrors[i].src_off, 4)
                 || !fence_readable(dev + g_counter_mirrors[i].dst_off, 4))
             continue;
         {
             volatile uint32_t *dst =
-                (volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].dst_off)
-                                      + g_memory_offset);
+                (volatile uint32_t *)XB_HOSTV((dev + g_counter_mirrors[i].dst_off));
             uint32_t src =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_counter_mirrors[i].src_off)
-                                       + g_memory_offset);
+                *(volatile uint32_t *)XB_HOSTV((dev + g_counter_mirrors[i].src_off));
             if (*dst != src)
                 *dst = src;
         }
@@ -1179,12 +1195,10 @@ static void frame_counter_bump(int i)
 
     if (!fence_readable(g_frame_counters[i].device_ptr_va, 4))
         return;
-    dev = *(volatile uint32_t *)((uintptr_t)g_frame_counters[i].device_ptr_va
-                                 + g_memory_offset);
+    dev = *(volatile uint32_t *)XB_HOSTV(g_frame_counters[i].device_ptr_va);
     if (!fence_readable(dev + g_frame_counters[i].counter_off, 4))
         return;
-    p = (volatile uint32_t *)((uintptr_t)(dev + g_frame_counters[i].counter_off)
-                              + g_memory_offset);
+    p = (volatile uint32_t *)XB_HOSTV((dev + g_frame_counters[i].counter_off));
     r = xbox_FrameCounterBump(&g_frame_counters[i].bump, p,
                               nv2a_pb_exec_flip_pacing(), GetTickCount());
     if (r == XBOX_FRAME_COUNTER_HANDED_OVER) {
@@ -1273,12 +1287,10 @@ uint32_t xbox_Nv2aFenceWordVa(void)
 
         if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
             continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
+        dev = *(volatile uint32_t *)XB_HOSTV(g_fence_mirrors[i].device_ptr_va);
         if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4))
             continue;
-        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
-                                         + g_memory_offset);
+        get_ptr = *(volatile uint32_t *)XB_HOSTV((dev + g_fence_mirrors[i].get_ptr_off));
         if (get_ptr >= 0x80000000u && get_ptr - 0x80000000u <= 0x04000000u - 4u
                 && !(get_ptr & 3u) && fence_readable(get_ptr, 4))
             return get_ptr;
@@ -1293,21 +1305,18 @@ static void fence_mirrors_tick(void)
 
         if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
             continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
+        dev = *(volatile uint32_t *)XB_HOSTV(g_fence_mirrors[i].device_ptr_va);
         if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
                 || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))
             continue;
-        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
-                                         + g_memory_offset);
+        get_ptr = *(volatile uint32_t *)XB_HOSTV((dev + g_fence_mirrors[i].get_ptr_off));
         if (!fence_readable(get_ptr, 4))
             continue;
         {
             volatile uint32_t *fence =
-                (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
+                (volatile uint32_t *)XB_HOSTV(get_ptr);
             uint32_t put =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
-                                       + g_memory_offset);
+                *(volatile uint32_t *)XB_HOSTV((dev + g_fence_mirrors[i].put_off));
             if (*fence != put)
                 *fence = put;
         }
@@ -1365,7 +1374,7 @@ static void framebuffer_probe_tick(void)
     last_ms = now;
     if ((size_t)s_fb_va + s_fb_pitch * s_fb_height > g_memory_size)
         return;
-    p = (const uint32_t *)((uintptr_t)s_fb_va + g_memory_offset);
+    p = (const uint32_t *)XB_HOSTV(s_fb_va);
     n = (s_fb_pitch * s_fb_height) / 4;
     for (i = 0; i < n; i++) {
         sum = sum * 33u + p[i];
@@ -1639,8 +1648,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
          * hardware whether or not anyone is asleep. GetTickCount() shares the
          * millisecond unit, so the rate matches. */
-        *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
-                               + g_memory_offset) = xbox_tick_ms();
+        *(volatile uint32_t *)XB_HOSTV((XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)) = xbox_tick_ms();
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
@@ -2704,6 +2712,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     }
 
     g_memory_offset = (uintptr_t)g_memory_base - XBOX_MAP_START;
+#ifdef NHL_X86
+    xbox_x86_init(g_memory_base, g_memory_size);      /* the translation table: RAM and its mirrors; the other windows register below */
+#endif
 #if defined(_WIN32)
     fprintf(stderr, "xbox_MemoryLayoutInit: guest window reservation: %s,"
             " base %p", g_win_reserve_method, g_memory_base);
@@ -2785,7 +2796,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Helper macro: convert Xbox VA to actual mapped address.
      * When g_memory_offset == 0 (ideal case), this is identity.
      */
-    #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    #define XBOX_VA(va) ((void *)XB_HOSTV((va)))
 
     /*
      * Copy XBE header to base address.
@@ -3004,7 +3015,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * slots, and kernel.h notes 366 is short by 12. A title importing
              * a high ordinal would have had its table truncated here. */
             for (uint32_t t = 0; t < XBOX_KERNEL_THUNK_TABLE_SIZE; t++) {
-                uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
+                uint32_t entry = *(volatile uint32_t *)XB_HOSTV((thunk_va + t * 4));
                 if (entry == 0) break;
                 thunk_count++;
             }
@@ -3059,7 +3070,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * We use free space in the BSS area for the fake structures.
      */
     {
-        #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+        #define XBOX_VA(va) ((void *)XB_HOSTV((va)))
         #define MEM32_INIT(va, val) (*(uint32_t *)XBOX_VA(va) = (uint32_t)(val))
 
         /* Fake TIB at address 0x0 */
@@ -3190,7 +3201,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Reserved before the kernel page below, which lives inside it.
      */
     {
+#ifdef NHL_X86
+        uintptr_t contig_native = 0;                      /* anywhere; registered in the translation table below */
+#else
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
+#endif
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
@@ -3201,6 +3216,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (!g_contig_memory)
             g_contig_memory = layout_commit_at((LPVOID)contig_native,
                                                XBOX_CONTIG_SIZE);
+#ifdef NHL_X86
+        if (g_contig_memory)
+            xbox_x86_map(XBOX_CONTIG_BASE, XBOX_CONTIG_SIZE, g_contig_memory);
+#endif
         if (g_contig_memory) {
             fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
                     XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
@@ -3241,7 +3260,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+#ifdef NHL_X86
+        g_nv2a_memory = xbox_x86_commit_region(XBOX_NV2A_BASE, XBOX_NV2A_SIZE);
+#else
         g_nv2a_memory = layout_commit_at((LPVOID)nv2a_native, XBOX_NV2A_SIZE);
+#endif
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
         s_nv2a_trace_kicks = getenv("RECOMP_NV2A_TRACE") != NULL;
@@ -3282,7 +3305,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+#ifdef NHL_X86
+        g_mcpx_memory = xbox_x86_commit_region(XBOX_MCPX_BASE, XBOX_MCPX_SIZE);
+#else
         g_mcpx_memory = layout_commit_at((LPVOID)mcpx_native, XBOX_MCPX_SIZE);
+#endif
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
             /* AC'97 codec ready.
@@ -3369,8 +3396,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
 
+#ifdef NHL_X86
+        g_flash_memory = xbox_x86_commit_region(XBOX_FLASH_BASE, XBOX_FLASH_SIZE);
+#else
         g_flash_memory = layout_commit_at((LPVOID)flash_native,
                                           XBOX_FLASH_SIZE);
+#endif
         if (g_flash_memory) {
             fprintf(stderr, "  Flash ROM aperture: %u MB at Xbox VA "
                     "0x%08X (zeroed, not a real BIOS image)\n",
@@ -3409,9 +3440,16 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uintptr_t kernel_native = XBOX_KERNEL_BASE + g_memory_offset;
         /* Already committed if the contiguous window above succeeded -
          * 0x80010000 sits inside it - so just use that storage. */
+#ifdef NHL_X86
+        g_kernel_memory = g_contig_memory
+            ? (void *)((uint8_t *)g_contig_memory + (XBOX_KERNEL_BASE - XBOX_CONTIG_BASE))
+            : NULL;
+        (void)kernel_native;
+#else
         g_kernel_memory = g_contig_memory
             ? (void *)kernel_native
             : layout_commit_at((LPVOID)kernel_native, KERNEL_ALLOC_SIZE);
+#endif
         if (g_kernel_memory) {
             /* Zero-fill then set e_lfanew = 0x80 (offset to PE header).
              * With the rest zeroed, NumberOfSections = 0 and the INIT
@@ -3448,6 +3486,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * intervals. All views alias the same physical pages, so reads and
      * writes at any mirror address correctly access the base data.
      */
+#ifndef NHL_X86          /* 32-bit: the mirrors are the translation table (xbox_x86_init), not views */
     {
         int mirrors_ok = 0;
         /* The tiled aperture is a specific architectural alias -- physical RAM
@@ -3515,6 +3554,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 mirrors_ok, XBOX_NUM_MIRRORS,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
+#endif
 
     /* Guest address space above the mirrors, for titles that ask for a specific
      * high address. RECOMP_EXT_VMA; a no-op without it. Straight after the
@@ -3581,10 +3621,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+#ifdef NHL_X86
+        if (g_contig_memory) {
+            xbox_x86_alias(XBOX_TILED_BASE, tiled_size, XBOX_CONTIG_BASE);
+            g_tiled_view = g_contig_memory;
+        } else {
+            g_tiled_view = NULL;
+        }
+        (void)tiled_native;
+#else
         g_tiled_view = g_contig_mapping
             ? layout_map_view(g_contig_mapping, tiled_size,
                               (LPVOID)tiled_native)
             : NULL;
+#endif
         if (g_tiled_view) {
             /* Prove the alias rather than assert it. Everything the title
              * renders goes through this window and is read back through the
@@ -3593,17 +3643,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * anywhere to say why. One write and one read turns that into a
              * startup line. Only when the contiguous window is where it
              * should be: if it fell back or failed, reading it would fault. */
-            if (g_contig_memory !=
-                    (void *)(uintptr_t)(XBOX_CONTIG_BASE + g_memory_offset)) {
+            if (g_contig_memory != (void *)XBOX_HOST(XBOX_CONTIG_BASE)) {
                 fprintf(stderr, "  WARNING: tiled aperture alias not checked:"
                         " contiguous window is not mapped\n");
             } else {
                 volatile uint32_t *via_tiled =
-                    (volatile uint32_t *)((uintptr_t)(XBOX_TILED_BASE + 0x1000)
-                                          + g_memory_offset);
+                    (volatile uint32_t *)XBOX_HOST(XBOX_TILED_BASE + 0x1000);
                 volatile uint32_t *via_contig =
-                    (volatile uint32_t *)((uintptr_t)(XBOX_CONTIG_BASE + 0x1000)
-                                          + g_memory_offset);
+                    (volatile uint32_t *)XBOX_HOST(XBOX_CONTIG_BASE + 0x1000);
                 uint32_t saved = *via_contig;
 
                 *via_tiled = 0xA5C30F17u;
@@ -3900,7 +3947,7 @@ static uint32_t heap_carve_free(uint32_t size, uint32_t alignment)
         g_heap_blocks[i].free = 0;
         if (back && !heap_insert_free(i + 1, start + size, back))
             g_heap_blocks[i].size += back;   /* table full: keep it attached */
-        memset((void *)((uintptr_t)start + g_memory_offset), 0, size);
+        memset((void *)XB_HOSTV(start), 0, size);
         return start;
     }
     return 0;
@@ -3941,7 +3988,7 @@ static int g_thread_stacks_used = 0;
 uint32_t xbox_AllocThreadTib(void)
 {
     /* XBOX_VA is scoped to the loader; the same arithmetic, spelled here. */
-    #define TIB_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+    #define TIB_VA(va) ((void *)XB_HOSTV((va)))
     const uint32_t tib_size = 0x40;
     uint32_t tib, block, thread_data, total;
 
@@ -4248,7 +4295,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     contig_unlock();
 
     if (result)
-        memset((void *)((uintptr_t)result + g_memory_offset), 0,
+        memset((void *)XB_HOSTV(result), 0,
                (size_t)n * CONTIG_PAGE);
     return result;
 }
@@ -4503,7 +4550,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             }
             g_heap_blocks[i].free = 0;
             result = g_heap_blocks[i].addr;
-            memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+            memset((void *)XB_HOSTV(result), 0, size);
             return result;
         }
     }
@@ -4550,7 +4597,7 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     g_heap_next = result + size;
 
     /* Zero-fill the allocated block (Xbox memory is always zeroed) */
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+    memset((void *)XB_HOSTV(result), 0, size);
 
     if (g_heap_block_count < XBOX_HEAP_MAX_BLOCKS) {
         g_heap_blocks[g_heap_block_count].addr = result;

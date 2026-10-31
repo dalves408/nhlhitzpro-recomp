@@ -219,7 +219,7 @@ static int gvs_try(void)
         p += (uint32_t)(mseg[i].lo & 15u);
         if ((uint64_t)p + len > GVS_BLOCK_MAX)
             return gvs_fail(GF_BIG, n);
-        memcpy(s_gvs_blk + p, (s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf : mem) + mseg[i].lo, (size_t)len);
+        memcpy(s_gvs_blk + p, (s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + mseg[i].lo : (const uint8_t *)XBOX_HOST((uint32_t)mseg[i].lo)), (size_t)len);
         segpos[i] = p;
         pos = p + (uint32_t)len;
     }

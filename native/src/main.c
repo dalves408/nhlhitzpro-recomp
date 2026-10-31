@@ -39,7 +39,13 @@
 #include <math.h>
 
 /* xboxrecomp runtime headers */
+#include <shlobj.h>
 #include <xbox/xboxrecomp.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
+#ifdef NHL_X86
+#define Rip Eip      /* the 32-bit CONTEXT: Eip, Esp */
+#define Rsp Esp
+#endif
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -198,7 +204,7 @@ static void print_guest_context(void *rip)
 
     if (g_xbox_mem_offset && g_esp) {
         const uint32_t *sp =
-            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+            (const uint32_t *)XBOX_HOST(g_esp);
         int shown = 0, i;
         fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
         for (i = 0; i < 256 && shown < 24; i++) {
@@ -231,19 +237,19 @@ static void print_guest_context(void *rip)
                 int j;
                 if (end == s)
                     break;
-                v = *(const uint32_t *)((uintptr_t)g_xbox_mem_offset + va);
+                v = *(const uint32_t *)XBOX_HOST(va);
                 fprintf(stderr, "  peek [0x%08X]=0x%08X", va, v);
                 while (*end == '>' && v >= 0x00010000u && v < 0x04000000u) {
                     uint32_t off = (uint32_t)strtoul(end + 1, &end, 0);
                     va = v + off;
-                    v = *(const uint32_t *)((uintptr_t)g_xbox_mem_offset + va);
+                    v = *(const uint32_t *)XBOX_HOST(va);
                     fprintf(stderr, " >[0x%08X]=0x%08X", va, v);
                 }
                 while (*end && *end != ',')
                     end++;
                 if (v >= 0x00010000u && v < 0x04000000u) {
                     const uint32_t *p =
-                        (const uint32_t *)((uintptr_t)g_xbox_mem_offset + v);
+                        (const uint32_t *)XBOX_HOST(v);
                     for (j = 0; j < 32; j++)
                         fprintf(stderr, "%s%08X", j % 8 ? " " : "\n     ", p[j]);
                 }
@@ -272,7 +278,7 @@ static void print_guest_context(void *rip)
                 if (v < 0x00010000u || v >= 0x04000000u || (v & 3)
                         || (v > g_xbox_code_lo && v < g_xbox_code_hi))
                     continue;
-                p = (const uint32_t *)((uintptr_t)g_xbox_mem_offset + v);
+                p = (const uint32_t *)XBOX_HOST(v);
                 fprintf(stderr, "  *[esp+%d]=0x%08X:", i * 4, v);
                 for (j = 0; j < 24; j++)
                     fprintf(stderr, "%s%08X", j % 8 ? " " : "\n     ", p[j]);
@@ -369,10 +375,13 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  TLS: fs_base=0x%08X fs4=0x%08X index=0x%08X\n",
                 g_fs_base,
-                *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base + 4),
-                *(uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x596AE8));
-        fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
-            (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+                *(uint32_t *)XBOX_HOST(g_fs_base + 4),
+                *(uint32_t *)XBOX_HOST(0x596AE8));
+        {
+            uint32_t fva = 0;
+            xbox_host_to_va((uintptr_t)fault_addr, &fva);     /* the 32-bit build looks the piece up in the table */
+            fprintf(stderr, "  Xbox VA of fault: 0x%08X\n", fva);
+        }
         print_guest_context((void *)ep->ContextRecord->Rip);
 
         /*
@@ -415,6 +424,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+#if defined(NHL_X86) && !defined(NHL_RELEASE)
+    /* 32-bit test build: started by a double click there is no console, so keep the log in files next to the exe. */
+    {
+        HANDLE he = GetStdHandle(STD_ERROR_HANDLE);
+        if (!he || he == INVALID_HANDLE_VALUE) {
+            freopen("hitz_log.txt", "w", stderr);
+            freopen("hitz_out.txt", "w", stdout);
+        }
+        if (!getenv("RECOMP_D3D9_LOG")) _putenv_s("RECOMP_D3D9_LOG", "1");
+    }
+#endif
+    /* Windows XP defines no LOCALAPPDATA: the settings, saves and shader cache are all found through it, so set it from the
+     * shell's idea of the folder when it is missing (a no-op on Vista and later). */
+    {
+        char la[MAX_PATH];
+        if (GetEnvironmentVariableA("LOCALAPPDATA", la, sizeof la) == 0 &&
+            SHGetFolderPathA(NULL, 0x001C /* CSIDL_LOCAL_APPDATA */, NULL, 0, la) == 0)
+            SetEnvironmentVariableA("LOCALAPPDATA", la);
+    }
 
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -497,6 +526,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
          * window/present, F11 borderless fullscreen, and the keyboard as the
          * controller (merged with a real pad, only while the window has
          * focus). */
+#ifdef NHL_DX9
+        /* Direct3D 9 build: GPU vertex programs through vs_3_0 (d3d9_gvs.inc); no depth-as-texture, no shader cache */
+        static const char *const d3d11_set[] = {
+            "RECOMP_D3D11_RC", "RECOMP_D3D11_GPUVS", "RECOMP_D3D11_SHAREZ",
+            "RECOMP_INLINE_SHORTFIX",
+            "RECOMP_NV_BLIT",
+            "RECOMP_TEXDEC_FAST",
+            "RECOMP_ASPECT_4_3", "RECOMP_F11_FULLSCREEN", "RECOMP_KEYBOARD",
+        };
+#else
         static const char *const d3d11_set[] = {
             "RECOMP_D3D11_RC", "RECOMP_D3D11_GPUVS", "RECOMP_D3D11_SHAREZ",
             "RECOMP_INLINE_SHORTFIX",
@@ -504,6 +543,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
             "RECOMP_TEXDEC_FAST", "RECOMP_D3D11_ZTEX", "RECOMP_D3D11_GPUVS_FARCLIP",
             "RECOMP_ASPECT_4_3", "RECOMP_F11_FULLSCREEN", "RECOMP_KEYBOARD",
         };
+#endif
         size_t i;
         for (i = 0; i < sizeof d3d11_set / sizeof d3d11_set[0]; i++) {
             const char *v = getenv(d3d11_set[i]);

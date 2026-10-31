@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 
 /* Where the registers can be trapped. They are answered by faulting on the
  * aperture and decoding the instruction that touched it: the x86-64 decoder
@@ -531,20 +532,20 @@ static uint32_t rd32(uint32_t va)
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    return *(uint32_t *)(((uint8_t *)XBOX_HOST(va)));
 }
 static void wr32(uint32_t va, uint32_t v)
 {
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+    *(uint32_t *)(((uint8_t *)XBOX_HOST(va))) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
     va = bus_resolve(va);
     return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+         ? ((uint8_t *)XBOX_HOST(va)) : NULL;
 }
 
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
@@ -908,8 +909,8 @@ static int ohci_isr_call(int index)
         return -1;                      /* nothing connected yet            */
 
     mem     = (uint8_t *)xbox_GetMemoryOffset();
-    routine = *(uint32_t *)(mem + kinterrupt + 0);
-    context = *(uint32_t *)(mem + kinterrupt + 4);
+    routine = *(uint32_t *)(((uint8_t *)XBOX_HOST(kinterrupt)) + 0);
+    context = *(uint32_t *)(((uint8_t *)XBOX_HOST(kinterrupt)) + 4);
     if (!routine)
         return -1;
 
@@ -921,9 +922,9 @@ static int ohci_isr_call(int index)
         return -1;
     }
 
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
+    g_esp -= 4; *(uint32_t *)(((uint8_t *)XBOX_HOST(g_esp))) = context;      /* arg 2 */
+    g_esp -= 4; *(uint32_t *)(((uint8_t *)XBOX_HOST(g_esp))) = kinterrupt;   /* arg 1 */
+    g_esp -= 4; *(uint32_t *)(((uint8_t *)XBOX_HOST(g_esp))) = 0xDEADBEEFu;  /* return address */
 
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     return (int)(g_eax & 1u);
@@ -1449,7 +1450,7 @@ void xbox_OhciInit(void)
         }
         for (i = 0; i < 2; i++) {
             DWORD old_protect;
-            LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
+            LPVOID at = (LPVOID)XBOX_HOST(s_hc[i].base);
             if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
                                 &old_protect)) {
                 s_enabled = 0;

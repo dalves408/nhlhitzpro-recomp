@@ -20,8 +20,35 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # data under %LOCALAPPDATA%\NHLHitzPro, no debug info, and the C runtime linked
 # statically so a player needs no Visual C++ redistributable.
 option(NHL_RELEASE "Player release build (no diagnostics, data in %LOCALAPPDATA%)" OFF)
-if(NHL_RELEASE AND MSVC)
+# 32-bit build (native 32-bit Windows, XP included): cmake -S native -B native/build-x86 -A Win32 -DNHL_X86=ON.
+# A 32-bit process cannot hold the guest's 4 GB address space, so guest addresses are translated through a table
+# (overrides/xbox_host.h, xbox_host_x86.c). Implies the Direct3D 9 back end.
+option(NHL_X86 "32-bit build: guest address translation" OFF)
+if(NHL_X86)
+    set(NHL_DX9 ON)
+endif()
+# Windows 7 build: cmake -S native -B native/build-dx9 -DNHL_DX9=ON [-DNHL_RELEASE=ON]. Direct3D 9 back end
+# (src/backend_d3d9.c, 1x native), XInput and shell dependencies resolved at run time, exe nhl_hitz_pro_recomp_dx9.
+# See DX9-PLAN.md. The default (Direct3D 11) build is unchanged.
+option(NHL_DX9 "Windows 7 build: Direct3D 9 back end, 1x native" OFF)
+if((NHL_RELEASE OR NHL_X86) AND MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+
+# Windows XP: the 32-bit build links VC-LTL (the C runtime of the OS's own msvcrt.dll instead of the UCRT, which XP does not
+# have) and YY-Thunks (stand-ins for the Vista/7/8/10 functions XP lacks, looked up at run time). Both are third-party
+# (VC-LTL5: EPL-2.0, YY-Thunks: MIT), downloaded outside the repository: NHL_XP_DIR holds vc-ltl/x (VC-LTL-Binary.7z unpacked)
+# and yy-thunks/x (YY-Thunks-Objs.zip unpacked). Set -DNHL_XP=OFF to build the 32-bit exe with the ordinary runtime.
+set(NHL_XP_DIR "C:/Recomp/xp-toolchain" CACHE PATH "folder with vc-ltl/x and yy-thunks/x (XP support for the 32-bit build)")
+option(NHL_XP "32-bit build that starts on Windows XP (VC-LTL + YY-Thunks)" ON)
+set(NHL_XP_ACTIVE OFF)
+if(NHL_X86 AND NHL_XP AND EXISTS "${NHL_XP_DIR}/vc-ltl/x/_msvcrt.h" AND EXISTS "${NHL_XP_DIR}/yy-thunks/x/objs/x86/YY_Thunks_for_WinXP.obj")
+    set(WindowsTargetPlatformMinVersion "5.1.2600.0")
+    include("${NHL_XP_DIR}/vc-ltl/x/VC-LTL helper for cmake.cmake")
+    set(NHL_XP_ACTIVE ON)
+    message(STATUS "XP support: VC-LTL + YY-Thunks from ${NHL_XP_DIR}")
+elseif(NHL_X86 AND NHL_XP)
+    message(WARNING "NHL_XP is on but ${NHL_XP_DIR} has no vc-ltl/x or yy-thunks/x: the 32-bit exe will not start on Windows XP")
 endif()
 
 # Common definitions
@@ -91,6 +118,50 @@ target_sources(host_time PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/host_tim
 target_sources(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/apu_xaudio2.c")
 
 
+if(NHL_X86)
+    foreach(t IN ITEMS xbox_kernel xbox_nv2a xbox_usb xbox_apu xbox_video xbox_d3d8 xbox_input xbox_dsound host_time platform)
+        get_target_property(NHL_T_TYPE ${t} TYPE)
+        if(TARGET ${t} AND NOT NHL_T_TYPE STREQUAL "INTERFACE_LIBRARY")
+            target_compile_definitions(${t} PRIVATE NHL_X86=1)
+            target_include_directories(${t} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+        endif()
+    endforeach()
+    target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/xbox_host_x86.c")
+    # the MMIO instruction decoder against the 32-bit CONTEXT (same API; defines MMIO_DECODE_H so the toolkit header is skipped)
+    foreach(t IN ITEMS xbox_apu xbox_usb)
+        target_compile_options(${t} PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/overrides/mmio_decode_x86.h")
+    endforeach()
+    # apu_core.c with the contiguous-window lookup going through the translation table
+    get_target_property(apu_x86_sources xbox_apu SOURCES)
+    list(REMOVE_ITEM apu_x86_sources apu_core.c)
+    set_property(TARGET xbox_apu PROPERTY SOURCES "${apu_x86_sources}")
+    target_sources(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/apu_core.c")
+    target_include_directories(xbox_apu PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xboxrecomp/src/apu" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xboxrecomp/src/nv2a" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xboxrecomp/src/kernel")
+    get_target_property(nv2a_sources xbox_nv2a SOURCES)
+    list(REMOVE_ITEM nv2a_sources nv2a_mmio_hook.c)
+    set_property(TARGET xbox_nv2a PROPERTY SOURCES "${nv2a_sources}")
+    target_sources(xbox_nv2a PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/nv2a_mmio_hook_x86.c")
+    # The generated header turns a guest address into a host address with one constant. Replace that by the table lookup
+    # (idempotent; the 64-bit definition stays under #else, so every build still compiles it).
+    set(NHL_GEN_TYPES "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_types.h")
+    if(EXISTS "${NHL_GEN_TYPES}")
+        file(READ "${NHL_GEN_TYPES}" NHL_TYPES_TXT)
+        string(FIND "${NHL_TYPES_TXT}" "NHL_X86" NHL_TYPES_DONE)
+        if(NHL_TYPES_DONE EQUAL -1)
+            string(REPLACE "#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)"
+"#ifdef NHL_X86
+extern uintptr_t g_xbox_off_tbl[256];
+static inline uintptr_t nhl_xbox_ptr(uint32_t a) { return (uintptr_t)a + g_xbox_off_tbl[a >> 24]; }
+#define XBOX_PTR(addr) nhl_xbox_ptr((uint32_t)(addr))
+#else
+#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#endif" NHL_TYPES_TXT "${NHL_TYPES_TXT}")
+            file(WRITE "${NHL_GEN_TYPES}" "${NHL_TYPES_TXT}")
+            message(STATUS "patched generated recomp_types.h for the 32-bit address table")
+        endif()
+    endif()
+endif()
+
 # Upstream runtime targets force /O2 even in Debug, conflicting with /RTC1.
 # Keep their optimization in release configurations and permit Debug builds.
 if(MSVC)
@@ -118,11 +189,16 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
-    src/backend_d3d11.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
 )
+
+if(NHL_DX9)
+    list(APPEND GAME_SOURCES src/backend_d3d9.c src/dx9_compat.c)
+else()
+    list(APPEND GAME_SOURCES src/backend_d3d11.c)
+endif()
 
 # The recomp pipeline also generates a dispatch header and function declarations.
 # These are included by the generated .c files:
@@ -159,6 +235,27 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 )
 
 # Windows SDK libraries needed at link time
+if(NHL_DX9)
+    # d3dcompiler and XInput are loaded at run time (dx9_compat.c, backend_d3d9.c): Windows 7 has no
+    # d3dcompiler_47.dll or xinput1_4.dll by default.
+    target_link_libraries(${PROJECT_NAME} PRIVATE d3d9 ole32 uuid dxguid winmm)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_DX9=1 _WIN32_WINNT=0x0601 WINVER=0x0601)
+    target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+    if(NHL_X86)
+        if(NHL_XP_ACTIVE)
+            target_link_libraries(${PROJECT_NAME} PRIVATE "${NHL_XP_DIR}/yy-thunks/x/objs/x86/YY_Thunks_for_WinXP.obj")
+            target_link_options(${PROJECT_NAME} PRIVATE "/SUBSYSTEM:WINDOWS,5.01")
+            # Linked in by toolkit code this project never runs (the D3D11 framebuffer presenter, the D3D8 shader compiler,
+            # the host movie/WMA decoders that need RECOMP_FMV_HOST): none of these DLLs exist on XP, so load them on first call.
+            target_link_libraries(${PROJECT_NAME} PRIVATE delayimp)
+            target_link_options(${PROJECT_NAME} PRIVATE "/DELAYLOAD:d3d11.dll" "/DELAYLOAD:d3dcompiler_47.dll"
+                                "/DELAYLOAD:mfreadwrite.dll" "/DELAYLOAD:mfplat.dll" "/DELAYLOAD:dxgi.dll")
+        endif()
+        target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_X86=1)
+        target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+    endif()
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME nhl_hitz_pro_recomp_dx9)
+else()
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
     dxgi
@@ -169,6 +266,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
     winmm
+)
+endif()
+target_link_libraries(${PROJECT_NAME} PRIVATE
     # Lets the fault handler resolve the host RIP back to the generated
     # function's symbol, i.e. to the guest function that faulted.
     dbghelp
@@ -189,9 +289,9 @@ endif()
 
 # MSVC-specific: large address aware, increase section limit for big generated files
 if(MSVC)
-    target_link_options(${PROJECT_NAME} PRIVATE
-        /LARGEADDRESSAWARE
-    )
+    if(NOT NHL_X86)
+        target_link_options(${PROJECT_NAME} PRIVATE /LARGEADDRESSAWARE)
+    endif()
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj /MP4)
 endif()

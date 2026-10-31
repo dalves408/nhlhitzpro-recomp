@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>   /* getenv */
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -106,7 +107,7 @@ extern ptrdiff_t g_xbox_mem_offset;
  */
 extern void sub_001C9790(void);
 static int nhl_trace_loader = -1;
-#define NHL_G32(a) (*(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + (a)))
+#define NHL_G32(a) (*(volatile uint32_t *)XBOX_HOST((a)))
 extern __declspec(thread) uint32_t g_esp;
 #define NHL_DEFER_SLOTS 256
 static uint32_t nhl_defer_seen[NHL_DEFER_SLOTS];
@@ -115,7 +116,7 @@ static unsigned nhl_defer_log;
 
 static void nhl_io_cb_job_handler(void)
 {
-    uint32_t job = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp + 8);
+    uint32_t job = *(volatile uint32_t *)XBOX_HOST(g_esp + 8);
     int i, free_slot = -1;
     /* Only the loader's own completion job is deferred; other IO callbacks keep their timing. */
     if (NHL_G32(job + 0x2C) != 0x0015C3D0u) { sub_001C9790(); return; }
@@ -177,7 +178,7 @@ static unsigned nhl_coalesce_log;
 
 static void nhl_coalesce_28A70(void)
 {
-    volatile uint32_t *ctr = (volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x3FCDFC);
+    volatile uint32_t *ctr = (volatile uint32_t *)XBOX_HOST(0x3FCDFC);
     if (nhl_coalesce_depth > 0) {
         *ctr = *ctr - 1;
         if (*ctr == 0) nhl_coalesce_pending = 1;
@@ -193,19 +194,19 @@ static void nhl_coalesce_2A4C0(void)
     uint32_t esp0 = g_esp; static unsigned dbg; static int dbgon = -1;
     if (dbgon < 0) { const char *e = getenv("RECOMP_TRACE_LOADER"); dbgon = (e && *e == '1'); }
     nhl_coalesce_depth++;
-    if (dbgon && dbg < 40) fprintf(stderr, "[COALESCE] 2A4C0 enter esp=%08X ret=%08X depth=%d\n", esp0, *(volatile uint32_t*)((uintptr_t)g_xbox_mem_offset + esp0), nhl_coalesce_depth);
+    if (dbgon && dbg < 40) fprintf(stderr, "[COALESCE] 2A4C0 enter esp=%08X ret=%08X depth=%d\n", esp0, *(volatile uint32_t*)XBOX_HOST(esp0), nhl_coalesce_depth);
     sub_0002A4C0();
     if (dbgon && dbg++ < 40) fprintf(stderr, "[COALESCE] 2A4C0 exit esp=%08X (expected %08X) eax=%08X\n", g_esp, esp0+4, g_eax);
     nhl_coalesce_depth--;
     if (nhl_coalesce_depth == 0 && nhl_coalesce_pending) {
-        volatile uint32_t *ctr = (volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x3FCDFC);
+        volatile uint32_t *ctr = (volatile uint32_t *)XBOX_HOST(0x3FCDFC);
         uint32_t eax = g_eax, ecx = g_ecx, edx = g_edx;
         nhl_coalesce_pending = 0;
         if (*ctr == 0) {
             fprintf(stderr, "[COALESCE] batch finished, counter=0: posting event 0x117 once\n");
             *ctr = 1;
             g_esp -= 4;
-            *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) = 0; /* dummy return address */
+            *(volatile uint32_t *)XBOX_HOST(g_esp) = 0; /* dummy return address */
             sub_00028A70();    /* --counter == 0 -> posts 0x117, pops the dummy */
             g_eax = eax; g_ecx = ecx; g_edx = edx;
         } else {
@@ -417,7 +418,7 @@ void nhl_guest_wbinvd(void)
  */
 void nhl_wait_gpu_fence(uint32_t word, uint32_t target)
 {
-    volatile LONG *completed = (volatile LONG *)((uintptr_t)g_xbox_mem_offset + word);
+    volatile LONG *completed = (volatile LONG *)XBOX_HOST(word);
     ULONGLONG start = GetTickCount64();
     while ((int32_t)((uint32_t)InterlockedCompareExchange(completed, 0, 0) - target) < 0) {
         if (GetTickCount64() - start > 10000) {

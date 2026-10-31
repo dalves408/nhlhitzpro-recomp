@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -437,7 +438,7 @@ void xbox_kernel_init(void)
 
         if (thunk_base && i < thunk_count && xbox_GetMemoryBase()) {
             uint32_t entry = *(volatile uint32_t *)
-                ((uintptr_t)(thunk_base + i * 4) + g_xbox_mem_offset);
+                XBOX_HOST((thunk_base + i * 4));
             if (entry == 0) {
                 break;  /* rest of the table is empty */
             }

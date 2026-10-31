@@ -43,6 +43,7 @@
 #include "../src/nv2a_pbx.h"   /* project: combiner/stage 1-3 state for the back end */
 #if defined(_WIN32)
 #include <windows.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread
@@ -574,7 +575,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 
         if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
-        p = mem + at;
+        p = ((uint8_t *)XBOX_HOST(at));
     }
 
     switch (a->type) {
@@ -715,7 +716,7 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(offset)
+        const uint8_t *row = ((uint8_t *)XBOX_HOST(dma_resolve(offset)))
                            + (size_t)(cy + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -926,7 +927,7 @@ static int td_fast(const Nv2aTexture *tex, uint32_t *out)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t w = tex->width, h = tex->height, fmt = tex->color, x, y;
-    const uint8_t *base = mem + tex->offset;
+    const uint8_t *base = ((uint8_t *)XBOX_HOST(tex->offset));
 
     if (!s_td_init) td_init_tables();
     if (d3d8_format_dxt_block_bytes(fmt)) {
@@ -1145,7 +1146,7 @@ static void clear_surface(uint32_t param)
          * its 128x128 shadow maps whole but draws them through a 124x124
          * clip, and samples them clamped -- the ring the clip leaves must be
          * the clear colour, or everything outside a shadow is dark. */
-        uint8_t *base = mem + s_gpu.color_base;
+        uint8_t *base = ((uint8_t *)XBOX_HOST(s_gpu.color_base));
         uint32_t sw = 1u << ((s_gpu.format >> 16) & 0xF);
         uint32_t sh = 1u << ((s_gpu.format >> 24) & 0xF);
         uint32_t x0 = s_gpu.clip_x, x1 = s_gpu.clip_x + s_gpu.clip_w;
@@ -1169,7 +1170,7 @@ static void clear_surface(uint32_t param)
             }
     } else
     for (y = 0; y < s_gpu.clip_h; y++) {
-        uint8_t *row = mem + s_gpu.color_base
+        uint8_t *row = ((uint8_t *)XBOX_HOST(s_gpu.color_base))
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
@@ -1396,7 +1397,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
                         uint32_t px[16]; } cache[4096];
         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        const uint8_t *blk = ((uint8_t *)XBOX_HOST(base)) + ((size_t)by * bw + bx) * bb;
         uintptr_t key = (uintptr_t)blk;
         size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
         uint64_t raw[2] = {0, 0};
@@ -1405,7 +1406,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
             uint32_t i;
             for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                d3d8_dxt_decode_texel(((uint8_t *)XBOX_HOST(base)), fmt, bx * 4 + (i & 3),
                                       by * 4 + (i >> 2), t->width,
                                       &cache[slot].px[i]);
             cache[slot].key = key;
@@ -1422,10 +1423,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + base;
+        p = ((uint8_t *)XBOX_HOST(base));
         u = swizzle_offset(u, v, t->width, t->height);
     } else {
-        p = mem + base + (size_t)v * t->pitch;
+        p = ((uint8_t *)XBOX_HOST(base)) + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -1444,7 +1445,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
         if (!t->palette)
             return 0;
-        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
+        *argb = ((const uint32_t *)(((uint8_t *)XBOX_HOST(t->palette))))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -1653,7 +1654,7 @@ static int surface_begin_batch(const uint8_t *mem)
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
-    s_surface = (uint8_t *)mem + base;
+    s_surface = ((uint8_t *)XBOX_HOST(base));
     return 1;
 }
 
@@ -3899,7 +3900,7 @@ static void draw_primitive(void)
                         fprintf(stderr, "[ATTRLOG]  a%u type %u size %u stride %u off %08X:", a2, (unsigned)va->type, (unsigned)va->size, (unsigned)va->stride, (unsigned)va->offset);
                         for (k = 0; k < 3 && k < s_gpu.idx_count; k++) {
                             uint64_t ad = (uint64_t)va->offset + (uint64_t)s_gpu.idx[k] * va->stride;
-                            const uint8_t *pp = s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + ad : mem2 + ad;
+                            const uint8_t *pp = s_gpu.inline_active ? (const uint8_t *)s_gpu.inline_buf + ad : ((uint8_t *)XBOX_HOST(ad));
                             if (!s_gpu.inline_active && !guest_span_ok(ad, 16)) { fprintf(stderr, " [bad]"); continue; }
                             fprintf(stderr, " i%u=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X", (unsigned)s_gpu.idx[k], pp[0], pp[1], pp[2], pp[3], pp[4], pp[5], pp[6], pp[7], pp[8], pp[9], pp[10], pp[11]);
                         }
@@ -4454,7 +4455,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      * held 0xFF000000 at times, which put the write outside guest memory). */
     if (subch == 0 && method == 0x1D70 && s_sem_va) {
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-        *(volatile uint32_t *)(mem + s_sem_va) = param;
+        *(volatile uint32_t *)(((uint8_t *)XBOX_HOST(s_sem_va))) = param;
         return;
     }
     if (!inited) {
@@ -4550,7 +4551,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
             if (va) {
                 uint32_t sem = *(volatile uint32_t *)
-                               ((uint8_t *)xbox_GetMemoryOffset() + va);
+                               (((uint8_t *)XBOX_HOST(va)));
                 param = (param & ~0x7Cu) | ((sem & 0x1Fu) << 2);
             }
         }
@@ -4675,9 +4676,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
-        memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
-        memset(mem + at + 12, 0, 4);
+        memcpy(((uint8_t *)XBOX_HOST(at)), &stamp, 8);
+        memcpy(((uint8_t *)XBOX_HOST(at)) + 8, &s_gpu.zpass_count, 4);
+        memset(((uint8_t *)XBOX_HOST(at)) + 12, 0, 4);
         break;
     }
     case NV097_SET_BLEND_COLOR:
@@ -5113,7 +5114,7 @@ static void peek_addresses(void)
         float f;
         if (va < 0x1000u || va >= 0x04000000u)
             continue;
-        v = *(const uint32_t *)(mem + va);
+        v = *(const uint32_t *)(((uint8_t *)XBOX_HOST(va)));
         memcpy(&f, &v, 4);
         fprintf(stderr, "  [PEEK] 0x%08X = %08X  (%g)\n", va, v, f);
     }
@@ -5151,7 +5152,7 @@ static void peek_chain(void)
                                 " pointer -- chain ends\n", step, cur);
                 return;
             }
-            cur = *(const uint32_t *)(mem + cur) + off;
+            cur = *(const uint32_t *)(((uint8_t *)XBOX_HOST(cur))) + off;
             fprintf(stderr, "  [CHAIN] step %d: deref +0x%X -> 0x%08X\n",
                     step, off, cur);
         }
@@ -5159,7 +5160,7 @@ static void peek_chain(void)
     }
     if (cur >= 0x1000u && cur + 4 < 0x04000000u)
         fprintf(stderr, "  [CHAIN] final value at 0x%08X = 0x%08X\n",
-                cur, *(const uint32_t *)(mem + cur));
+                cur, *(const uint32_t *)(((uint8_t *)XBOX_HOST(cur))));
     fflush(stderr);
 }
 

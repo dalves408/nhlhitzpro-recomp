@@ -25,6 +25,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -280,7 +281,7 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
 {
     while (s_pend_left && s_get < PB_RAM_BYTES && s_get != put) {
         uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
-        uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
+        uint32_t param = *(const uint32_t *)(((uint8_t *)XBOX_HOST((0x80000000u | s_get))));
 
         if (s_scan_enabled) note(s_pend_subch, m);
         /* Same walk, two consumers: the survey counts, the executor
@@ -341,7 +342,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             s_get = put, s_pend_left = 0;
             break;
         }
-        w = *(const uint32_t *)(mem + (0x80000000u | s_get));
+        w = *(const uint32_t *)(((uint8_t *)XBOX_HOST((0x80000000u | s_get))));
         s_hist[s_hist_n % PB_HIST].at = at;
         s_hist[s_hist_n % PB_HIST].w = w;
         s_hist_n++;
@@ -473,7 +474,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w = *(const uint32_t *)(((uint8_t *)XBOX_HOST(va)));
         va += 4;
         words++;
 
@@ -513,7 +514,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                 if (s_scan_enabled) note(subch, m);   /* the inventory is only read by a survey */
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                                        *(const uint32_t *)(((uint8_t *)XBOX_HOST(va))));
                 va += 4;
                 words++;
             }

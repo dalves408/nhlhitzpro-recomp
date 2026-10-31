@@ -19,9 +19,11 @@
 #define COBJMACROS
 #include <windows.h>
 #include <xaudio2.h>
+#include <mmsystem.h>
 
 #pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winmm.lib")
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
@@ -68,6 +70,56 @@ static ULONGLONG g_xa2_underrun_logged;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
 
+/* PROJECT OVERRIDE (NHL Hitz Pro): waveOut fallback for Windows 7, which has neither xaudio2_9 nor
+ * xaudio2_8 (xaudio2_7 needs the DirectX June 2010 runtime). Same buffers, same pacing contract. */
+static HWAVEOUT g_wo;
+static WAVEHDR  g_wo_hdr[XA2_NUM_BUFS_MAX + 1];
+
+static int wo_open(void)
+{
+    WAVEFORMATEX wfx = { 0 };
+    int i;
+    wfx.wFormatTag      = WAVE_FORMAT_PCM;
+    wfx.nChannels       = XA2_CHANNELS;
+    wfx.nSamplesPerSec  = XA2_SAMPLE_RATE;
+    wfx.wBitsPerSample  = 16;
+    wfx.nBlockAlign     = XA2_CHANNELS * 2;
+    wfx.nAvgBytesPerSec = XA2_SAMPLE_RATE * wfx.nBlockAlign;
+    if (waveOutOpen(&g_wo, WAVE_MAPPER, &wfx, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+        g_wo = NULL;
+        return 0;
+    }
+    for (i = 0; i < XA2_RING; i++) {
+        memset(&g_wo_hdr[i], 0, sizeof g_wo_hdr[i]);
+        g_wo_hdr[i].lpData = (LPSTR)g_xa2_bufs[i];
+        g_wo_hdr[i].dwBufferLength = XA2_BUF_SAMPLES * XA2_CHANNELS * sizeof(int16_t);
+        if (waveOutPrepareHeader(g_wo, &g_wo_hdr[i], sizeof g_wo_hdr[i]) != MMSYSERR_NOERROR) {
+            waveOutClose(g_wo); g_wo = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void wo_close(void)
+{
+    int i;
+    if (!g_wo) return;
+    waveOutReset(g_wo);
+    for (i = 0; i < XA2_RING; i++)
+        waveOutUnprepareHeader(g_wo, &g_wo_hdr[i], sizeof g_wo_hdr[i]);
+    waveOutClose(g_wo);
+    g_wo = NULL;
+}
+
+static int wo_queued(void)
+{
+    int i, n = 0;
+    for (i = 0; i < XA2_RING; i++)
+        if (g_wo_hdr[i].dwFlags & WHDR_INQUEUE) n++;
+    return n;
+}
+
 int xa2_init(void)
 {
     HRESULT hr;
@@ -89,9 +141,20 @@ int xa2_init(void)
     }
     com_initialized = SUCCEEDED(hr);
 
-    hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
+    hr = getenv("RECOMP_AUDIO_WAVEOUT") ? E_FAIL : XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);   /* WAVEOUT=1: force the Windows 7 path */
     if (FAILED(hr) || !g_xa2) {
         fprintf(stderr, "[XA2] XAudio2Create failed: 0x%08lX\n", hr);
+        g_xa2 = NULL;
+        if (wo_open()) {
+            g_xa2_next_buf = 0;
+            g_xa2_fill = 0;
+            g_xa2_dry = 0;
+            g_xa2_initialized = 1;
+            g_xa2_frames_written = 0;
+            fprintf(stderr, "[XA2] waveOut initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
+                    XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+            return 1;
+        }
         goto fail;
     }
 
@@ -144,6 +207,7 @@ fail:
 
 void xa2_shutdown(void)
 {
+    wo_close();
     if (g_xa2_source) {
         IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
         IXAudio2SourceVoice_FlushSourceBuffers(g_xa2_source);
@@ -167,6 +231,7 @@ void xa2_shutdown(void)
 /* PROJECT OVERRIDE (NHL Hitz Pro): silence the output while the game is paused. */
 void xa2_set_muted(int muted)
 {
+    if (g_wo) waveOutSetVolume(g_wo, muted ? 0 : 0xFFFFFFFFu);
     if (g_xa2_master)
         g_xa2_master->lpVtbl->SetVolume(g_xa2_master, muted ? 0.0f : 1.0f, 0);
 }
@@ -189,7 +254,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     int idx, n, ok = 1;
     HRESULT hr;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!g_xa2_initialized || (!g_xa2_source && !g_wo)) return 0;
 
     {   /* RECOMP_AUDIO_DUMP=<file>: every sample handed over, raw 48 kHz stereo 16-bit, to find audio faults */
         static FILE *dump; static int dump_init;
@@ -210,6 +275,13 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
             break;
 
         g_xa2_fill = 0;
+        if (g_wo) {
+            if (wo_queued() >= XA2_NUM_BUFS) { ok = 0; continue; }
+            if (waveOutWrite(g_wo, &g_wo_hdr[idx], sizeof g_wo_hdr[idx]) != MMSYSERR_NOERROR) { ok = 0; continue; }
+            g_xa2_next_buf = (idx + 1) % XA2_RING;
+            g_xa2_frames_written++;
+            continue;
+        }
         IXAudio2SourceVoice_GetState(g_xa2_source, &state,
                                      XAUDIO2_VOICE_NOSAMPLESPLAYED);
         if ((int)state.BuffersQueued >= XA2_NUM_BUFS) { ok = 0; continue; }
@@ -245,9 +317,13 @@ int xa2_queued_samples(void)
 {
     XAUDIO2_VOICE_STATE state;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
-    IXAudio2SourceVoice_GetState(g_xa2_source, &state,
-                                 XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    if (!g_xa2_initialized || (!g_xa2_source && !g_wo)) return 0;
+    if (g_wo) {
+        state.BuffersQueued = (UINT32)wo_queued();
+    } else {
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state,
+                                     XAUDIO2_VOICE_NOSAMPLESPLAYED);
+    }
     if (state.BuffersQueued == 0 && g_xa2_frames_written > 0) {
         if (!g_xa2_dry) {
             ULONGLONG now = GetTickCount64();
@@ -280,7 +356,13 @@ uint64_t xa2_samples_played(void)
 {
     XAUDIO2_VOICE_STATE state;
 
-    if (!g_xa2_initialized || !g_xa2_source) return 0;
+    if (!g_xa2_initialized || (!g_xa2_source && !g_wo)) return 0;
+    if (g_wo) {
+        MMTIME t;
+        t.wType = TIME_SAMPLES;
+        if (waveOutGetPosition(g_wo, &t, sizeof t) != MMSYSERR_NOERROR || t.wType != TIME_SAMPLES) return 0;
+        return t.u.sample;
+    }
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
     return state.SamplesPlayed;
 }

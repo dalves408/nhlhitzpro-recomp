@@ -20,6 +20,7 @@
 #include "platform/host_time.h"
 #if defined(_WIN32)
 #include <intrin.h>
+#include "xbox_host.h"          /* guest -> host address (the 32-bit build translates per 16 MB piece) */
 #endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
