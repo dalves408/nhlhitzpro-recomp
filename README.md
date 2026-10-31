@@ -11,12 +11,13 @@ This project contains **no game content**. You need your own copy of the Xbox di
 - Windows 10 or 11, 64-bit
 - A GPU with Direct3D 11 support (any from the last decade)
 - A multi-core CPU (the game's vertex work and audio run on the CPU)
+- On a laptop with two graphics chips (NVIDIA Optimus, AMD switchable) the game asks Windows for the faster one
 - About 2 GB of free disk space (plus about 1.3 GB for the optional hi-res texture pack)
 - Your own **NHL Hitz Pro (USA)** disc, as an `.iso` / `.xiso` image or as a folder with the game's files (the folder that holds `default.xbe`)
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.6.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.8.exe` and choose where to install.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
 3. On the **Hi-res texture pack** page, tick the box to add the 4x texture pack (see below). It is optional.
 4. Start **NHL Hitz Pro** from the Start menu.
@@ -52,6 +53,7 @@ XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to 
 - The first time through a new part of the game, a short stutter can appear while shaders are built. It does not return once they are cached.
 - Some visual details differ from the original console: the entrance tunnel haze, the ice and jersey look, and skate-wear textures on the ice.
 - On rare starts the screen stays black after the intro; close the game and start it again.
+- A winning-team replay has been seen once not drawing correctly (no crash); it is being looked into.
 - Only the USA release is supported. The disc check will refuse any other region or revision.
 
 ## Building from source
@@ -83,6 +85,17 @@ cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp
 ```
 
 The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup). `native/installer/gen_manifest.py` regenerates the list of disc files and the `default.xbe` hash it checks. The texture pack add-on is built from `native/installer/nhl_hitz_pro_textures.iss`; `gen_pack_manifest.py` writes the pack's file list (`manifest.txt`) and the release data (`pack_release.iss`: file name, size, SHA-256 and download address) that the game installer checks.
+
+## Debug builds and other branches
+
+A normal release writes no log. When a problem has to be tracked down on someone else's PC, a separate **debug build** of the same game is made: it logs to `%LOCALAPPDATA%\NHLHitzPro\debug`, writes a crash dump and zips it to the Desktop, and the player can press **DEL** to mark a graphical glitch (screenshots, a dump and the log are zipped when the game is closed). It is never part of a release; see `native/DEBUG-BUILD.md`.
+
+Work that is not part of the releases lives on its own branches:
+
+| Branch | What it is |
+|---|---|
+| `winxp` | A Direct3D 9 / 32-bit port for Windows 7 and XP (test builds only, not released; see `native/DX9-PLAN.md`) |
+| `debug-kit` | `xrdbg`, the debug kit above made reusable for other statically recompiled Xbox games (`README.md` and `CUSTOMIZING.md` on that branch) |
 
 ## How it works
 
