@@ -109,6 +109,10 @@ static struct {
     uint32_t dump_every, dump_n;
 } g;
 
+#ifdef NHL_DEBUGLOG
+uint64_t nhl_flip_count(void) { return (uint64_t)g.flips; }   /* debug_report.c: frames presented */
+#endif
+
 static void logf_(const char *fmt, ...)
 {
     va_list ap;
@@ -117,6 +121,15 @@ static void logf_(const char *fmt, ...)
     vfprintf(stderr, fmt, ap);
     va_end(ap);
 }
+
+#ifdef NHL_DEBUGLOG
+extern void nhl_debug_note_exit(const char *why);
+extern void nhl_debug_mark(void);                               /* DEL: a graphical problem is here (debug_report.c) */
+extern int nhl_debug_capture_due(char *path, size_t n);         /* a screenshot path to write now, if one is due */
+#define NHL_NOTE_EXIT(w) nhl_debug_note_exit(w)
+#else
+#define NHL_NOTE_EXIT(w) ((void)0)
+#endif
 
 /* RECOMP_KEYLOG: every key press and release in the game window, with the
  * seconds since the process started and the pad button it stands for (the
@@ -496,7 +509,7 @@ static void set_change(int i, int dir)
     } else if (dir == 0) {
         if (i == IT_CLOSE) quit_close();
         else if (i == IT_QUIT) {
-            if (s_set_armed) TerminateProcess(GetCurrentProcess(), 0);
+            if (s_set_armed) { NHL_NOTE_EXIT("quit chosen in the settings overlay"); TerminateProcess(GetCurrentProcess(), 0); }
             s_set_armed = 1;
         }
     }
@@ -742,6 +755,12 @@ static void quit_tick(void)
 static int quit_key(WPARAM w, LPARAM l, int down)
 {
     int repeat = (l & (1L << 30)) != 0;
+#ifdef NHL_DEBUGLOG
+    if (w == VK_DELETE) {                 /* debug build: mark a graphical problem, the game does not see the key */
+        if (down && !repeat) nhl_debug_mark();
+        return 1;
+    }
+#endif
     if (s_q_active && s_set_active) return set_key(w, l, down);
     if (w == VK_ESCAPE) {
         if (down && !repeat) { if (s_q_active) quit_close(); else quit_open(); }
@@ -752,9 +771,10 @@ static int quit_key(WPARAM w, LPARAM l, int down)
         s_q_sel = (w == VK_LEFT || w == 'A') ? 0 : (w == VK_RIGHT || w == 'D') ? 1 : !s_q_sel;
         quit_draw();
     } else if (down && !repeat && (w == VK_RETURN || w == VK_SPACE)) {
-        if (s_q_sel) TerminateProcess(GetCurrentProcess(), 0);
+        if (s_q_sel) { NHL_NOTE_EXIT("quit chosen in the Esc menu"); TerminateProcess(GetCurrentProcess(), 0); }
         quit_close();
     } else if (down && !repeat && w == 'Y') {
+        NHL_NOTE_EXIT("quit chosen in the Esc menu");
         TerminateProcess(GetCurrentProcess(), 0);
     } else if (down && !repeat && w == 'N') {
         quit_close();
@@ -780,6 +800,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CLOSE:
     case WM_DESTROY:
         /* The guest threads keep running; ExitProcess can wait on them. */
+        NHL_NOTE_EXIT("the game window was closed");
         TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     case WM_KEYDOWN: case WM_SYSKEYDOWN:
@@ -867,6 +888,18 @@ static int init_window_and_device(void)
         return 0;
     }
     logf_("device up, feature level 0x%X\n", (unsigned)fl);
+    {   /* which graphics card the game got (hybrid laptops pick one of two) */
+        IDXGIDevice *dxd = NULL;
+        IDXGIAdapter *ad = NULL;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(g.dev, &IID_IDXGIDevice, (void **)&dxd)) && SUCCEEDED(IDXGIDevice_GetAdapter(dxd, &ad))) {
+            DXGI_ADAPTER_DESC desc;
+            if (SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
+                logf_("adapter: %ls (vendor 0x%04X, device 0x%04X, %u MB dedicated video memory)\n", desc.Description, desc.VendorId,
+                      desc.DeviceId, (unsigned)(desc.DedicatedVideoMemory >> 20));
+            IDXGIAdapter_Release(ad);
+        }
+        if (dxd) IDXGIDevice_Release(dxd);
+    }
     if (!init_pipeline()) { g.failed = 1; return 0; }
     return 1;
 }
@@ -3557,6 +3590,17 @@ static void be_flip(void)
     }
     s_asp_last = NULL;
     rt_resolve(best);
+#ifdef NHL_DEBUGLOG
+    if (best) {                          /* screenshots of the game image for a DEL mark (bmp, beside the log) */
+        char cap[MAX_PATH];
+        while (nhl_debug_capture_due(cap, sizeof cap)) {
+            const char *keep = g.dump_prefix;
+            g.dump_prefix = "";
+            dump_tex(best->tex, cap, 0);
+            g.dump_prefix = keep;
+        }
+    }
+#endif
     if (best && (aspect_on() || s_scale > 1 || s_stretch || msaa_effective() > 1) && !s_asp_fail) {
         s_asp_busy = 1;
         if (g.dump_prefix && g.dump_every && (g.flips % g.dump_every) == 0)

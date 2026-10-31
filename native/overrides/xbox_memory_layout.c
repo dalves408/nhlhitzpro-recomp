@@ -4138,6 +4138,8 @@ void xbox_FreeThreadStack(uint32_t stack_top)
 static uint8_t  g_contig_used[CONTIG_PAGES] = { CONTIG_RESERVED };
                                                /* 1 = page belongs to a block */
 static uint32_t g_contig_len[CONTIG_PAGES];    /* pages, at a block's first page */
+static uint8_t  g_contig_deferred[CONTIG_PAGES];   /* 1 at the first page of a block the title freed and we kept */
+static uint32_t g_contig_deferred_pages;
 static uint32_t g_contig_pages_in_use;
 static uint32_t g_contig_high = CONTIG_PAGE;   /* high-water mark, bytes */
 static uint32_t g_contig_first_free = 1;       /* no free page below this */
@@ -4197,6 +4199,38 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Give back every block the title freed and we kept (see xbox_ContiguousFree). Lock held. Returns the pages released. */
+static uint32_t contig_release_deferred(void)
+{
+    uint32_t q, released = 0, blocks = 0;
+
+    for (q = 0; q < CONTIG_PAGES; q++) {
+        uint32_t n;
+        if (!g_contig_deferred[q])
+            continue;
+        g_contig_deferred[q] = 0;
+        n = g_contig_len[q];
+        if (!n)
+            continue;
+        memset(&g_contig_used[q], 0, n);
+        g_contig_len[q] = 0;
+        g_contig_pages_in_use -= n;
+        if (q < g_contig_first_free)
+            g_contig_first_free = q;
+        g_contig_frees++;
+        released += n;
+        blocks++;
+    }
+    g_contig_deferred_pages = 0;
+    if (released) {
+        fprintf(stderr, "  [CONTIG] arena full: reused %u KB from %u blocks the title had freed; %u of %u KB in use now\n",
+                released * (CONTIG_PAGE / 1024), blocks, g_contig_pages_in_use * (CONTIG_PAGE / 1024),
+                (unsigned)(CONTIG_USABLE * (CONTIG_PAGE / 1024)));
+        fflush(stderr);
+    }
+    return released;
+}
+
 /* Whether page q may start or extend a new block.
  *
  * The first pass also keeps out of the loaded image's physical range. Here
@@ -4234,7 +4268,8 @@ static int contig_page_free(uint32_t q, int avoid_image)
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
-    uint32_t n, align_pages, lo_page, limit, p, q, pass, result = 0;
+    uint32_t n, align_pages, lo_page, lo_req, limit, p, q, pass, result = 0;
+    int attempt;
 
     if (alignment < CONTIG_PAGE) alignment = CONTIG_PAGE;
     if (alignment & (alignment - 1)) {            /* round up to a power of 2 */
@@ -4250,9 +4285,22 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
     lo_page = (uint32_t)(((uint64_t)phys_lo + CONTIG_PAGE - 1) / CONTIG_PAGE);
     limit = (uint32_t)(((uint64_t)phys_hi + 1) / CONTIG_PAGE);
     if (limit > CONTIG_USABLE) limit = CONTIG_USABLE;
+    {   /* RECOMP_CONTIG_CAP_KB=n: a smaller arena, to exercise the arena-full path without playing several matches */
+        static uint32_t cap = 0xFFFFFFFFu;
+        if (cap == 0xFFFFFFFFu) {
+            const char *e = getenv("RECOMP_CONTIG_CAP_KB");
+            cap = e && atoi(e) > 0 ? (uint32_t)atoi(e) / (CONTIG_PAGE / 1024) : 0;
+        }
+        if (cap && limit > cap) limit = cap;
+    }
 
     contig_lock();
-    if (lo_page < g_contig_first_free) lo_page = g_contig_first_free;
+    lo_req = lo_page;
+    /* Second attempt only when the arena is full: blocks the title freed are given back first. */
+    for (attempt = 0; attempt < 2 && !result; attempt++) {
+    if (attempt && !(g_contig_deferred_pages && contig_release_deferred()))
+        break;
+    lo_page = lo_req < g_contig_first_free ? g_contig_first_free : lo_req;
     for (pass = contig_avoid_image() ? 0 : 1; pass < 2 && !result; pass++) {
         int avoid = pass == 0;
         p = (lo_page + align_pages - 1) & ~(align_pages - 1);
@@ -4274,6 +4322,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             while (q < limit && !contig_page_free(q, avoid)) q++;
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
+    }
     }
     if (result) {
         g_contig_allocs++;
@@ -4345,11 +4394,20 @@ int xbox_ContiguousFree(uint32_t va)
     if (va < XBOX_CONTIG_BASE
             || (uint64_t)va >= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return 0;
-    /* Ours, but kept: without RECOMP_HEAP_RECLAIM contiguous memory is never
-     * reused, and 1 stops the caller handing it to the general heap. */
-    if (!xbox_HeapReclaimEnabled())
-        return 1;
     first = (va - XBOX_CONTIG_BASE) / CONTIG_PAGE;
+    /* Ours, but kept: without RECOMP_HEAP_RECLAIM a freed block stays where it is, so every later allocation gets the
+     * address it always got, and 1 stops the caller handing it to the general heap. The block is only remembered as
+     * freed: xbox_ContiguousAllocEx gives those pages back when the arena would otherwise run out (a match leaves
+     * about 13 MB of freed blocks behind, and the third one used to end in a failed allocation and a crash). */
+    if (!xbox_HeapReclaimEnabled()) {
+        contig_lock();
+        if (!(va & (CONTIG_PAGE - 1)) && g_contig_len[first] && !g_contig_deferred[first]) {
+            g_contig_deferred[first] = 1;
+            g_contig_deferred_pages += g_contig_len[first];
+        }
+        contig_unlock();
+        return 1;
+    }
 
     contig_lock();
     n = (va & (CONTIG_PAGE - 1)) ? 0 : g_contig_len[first];

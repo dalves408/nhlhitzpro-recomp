@@ -103,6 +103,9 @@ extern ptrdiff_t g_xbox_mem_offset;
  * and everything the game writes goes to %LOCALAPPDATA%\NHLHitzPro so an
  * install under Program Files works. */
 static char s_user_data[MAX_PATH];     /* %LOCALAPPDATA%\NHLHitzPro\SaveData */
+#ifdef NHL_DEBUGLOG
+extern void nhl_debug_init(void);      /* debug_report.c */
+#endif
 
 static void release_init(void)
 {
@@ -113,12 +116,22 @@ static void release_init(void)
         *sl = 0;
         SetCurrentDirectoryA(exe);
     }
+#ifdef NHL_DEBUGLOG
+    /* Debug build: the log goes to %LOCALAPPDATA%\NHLHitzPro\debug (debug_report.c), the diagnostic
+     * switches stay available, and the ones that cost little are on. */
+    nhl_debug_init();
+    env = NULL;
+    if (!getenv("RECOMP_CRASH_DEEP")) _putenv_s("RECOMP_CRASH_DEEP", "1");
+    if (!getenv("RECOMP_KEYLOG")) _putenv_s("RECOMP_KEYLOG", "1");
+    if (!getenv("RECOMP_APU_TRACE")) _putenv_s("RECOMP_APU_TRACE", "1");
+#else
     /* No console output or log lines of any kind. */
     freopen("NUL", "w", stdout);
     freopen("NUL", "w", stderr);
     /* The RECOMP_* diagnostic and tuning switches are a developer interface:
      * drop whatever the environment carries and let the defaults below apply. */
     env = GetEnvironmentStringsA();
+#endif
     if (env) {
         for (p = env; *p; p += strlen(p) + 1) {
             if (strncmp(p, "RECOMP_", 7) == 0) {
@@ -322,6 +335,18 @@ static void print_guest_context(void *rip)
     }
 }
 
+#ifdef NHL_DEBUGLOG
+/* debug_report.c, on a fatal exception that is not an emulated-hardware access: the guest registers,
+ * the guest function that faulted and the call chain recovered from the guest stack. */
+void nhl_crash_context(PEXCEPTION_POINTERS ep)
+{
+    fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n", g_eax, g_ecx, g_edx, g_esp);
+    fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n", g_ebx, g_esi, g_edi);
+    if (ep && ep->ExceptionRecord)
+        print_guest_context(ep->ExceptionRecord->ExceptionAddress);
+}
+#endif
+
 /* The emulated APU.
  *
  * Two entry points that had no callers anywhere in the tree. apu_mmio_hook.c
@@ -411,6 +436,11 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+/* Ask hybrid-graphics laptops (NVIDIA Optimus, AMD switchable) to run the game
+ * on the discrete GPU; the drivers read these exported variables from the exe. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 /* ── WinMain ───────────────────────────────────────────────── */
 

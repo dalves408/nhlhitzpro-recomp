@@ -5,10 +5,18 @@
 ; then compile this script with ISCC.exe. Output: native\installer\Output\NHLHitzPro-Setup-<version>.exe
 ; If the game is already installed (its game files are in place), Setup only updates the program files:
 ; it does not ask for the disc and does not copy the 1.5 GB of game files again.
-#define AppVersion "1.0.6"
+; ISCC /DAppVersion=... /DBuildDir=... /DOutSuffix=-debug /DDebugBuild=1 build a local debug installer (see collect_debug.ps1)
+#ifndef AppVersion
+#define AppVersion "1.0.8"
+#endif
+#ifndef OutSuffix
+#define OutSuffix ""
+#endif
 #include "pack_version.iss"
 #include "pack_release.iss"
+#ifndef BuildDir
 #define BuildDir "..\build-release\Release"
+#endif
 
 [Setup]
 AppId={{6F1D2B7E-3C54-4A8B-9E10-4C0D7A55B1E2}
@@ -33,7 +41,7 @@ SetupIconFile=..\resources\nhl_hitz_pro.ico
 ; the picture at the top right of every wizard page is the same icon (the sizes are for different screen scalings)
 WizardSmallImageFile=wizard_small_55.bmp,wizard_small_64.bmp,wizard_small_80.bmp,wizard_small_96.bmp,wizard_small_128.bmp
 UninstallDisplayIcon={app}\nhl_hitz_pro_recomp.exe
-OutputBaseFilename=NHLHitzPro-Setup-{#AppVersion}
+OutputBaseFilename=NHLHitzPro-Setup-{#AppVersion}{#OutSuffix}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -47,11 +55,23 @@ Source: "{#BuildDir}\nhl_hitz_pro_recomp.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\nhl_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
+#ifdef DebugBuild
+Source: "collect_debug.ps1"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 
 [Icons]
+#ifdef DebugBuild
+Name: "{autoprograms}\NHL Hitz Pro - Debug"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\NHL Hitz Pro Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\NHL Hitz Pro - Debug"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+#else
 Name: "{autoprograms}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
 Name: "{autoprograms}\NHL Hitz Pro Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+#endif
+#ifdef DebugBuild
+Name: "{autoprograms}\NHL Hitz Pro - Collect debug files"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\collect_debug.ps1"""; WorkingDir: "{app}"
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
