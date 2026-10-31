@@ -207,7 +207,7 @@ endif()
 if(NHL_DEBUGLOG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_DEBUGLOG=1)
     target_compile_definitions(xbox_kernel PRIVATE NHL_DEBUGLOG=1)
-    target_link_libraries(${PROJECT_NAME} PRIVATE psapi)
+    target_link_libraries(${PROJECT_NAME} PRIVATE psapi shell32)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nhl_debug_tag.h" "#define NHL_DEBUG_TAG \"${NHL_DEBUG_TAG}\"
 ")
     target_include_directories(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

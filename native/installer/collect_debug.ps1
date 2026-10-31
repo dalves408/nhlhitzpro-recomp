@@ -29,11 +29,19 @@ try {
     $gpu = Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) driver $($_.DriverVersion)" }
     @("Windows: $($os.Caption) $($os.Version)", "GPU: " + ($gpu -join '; '), "Collected: $stamp") | Set-Content $info
     if (Test-Path $zip) { Remove-Item $zip }
-    Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+    # tar.exe (Windows 10 1803+) writes a normal zip and copes with the large dumps better than Compress-Archive
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (Test-Path $tar) {
+        & $tar -a -c -f $zip -C $stage .
+        if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
+    } else {
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
+    }
     $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
     Say ("Saved $mb MB to your Desktop:`n$zip`n`nSend that file.") 'Information'
     if (-not $quiet) { Start-Process explorer.exe "/select,`"$zip`"" }
 } catch {
+    try { "$(Get-Date -Format s) $($_ | Out-String)" | Add-Content (Join-Path $dbg 'collect_error.txt') } catch { }
     Say ("Could not collect the files:`n$($_.Exception.Message)`n`nYou can zip this folder by hand:`n$dbg") 'Error'
 } finally {
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }

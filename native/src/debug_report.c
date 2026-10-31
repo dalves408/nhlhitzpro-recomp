@@ -11,6 +11,11 @@
  *   running.lock                present while the game runs; found at the next start it means the last session
  *                               ended without a clean exit (killed, power loss, crash that bypassed the handlers)
  *
+ * DEL in the game window marks "a graphical problem is here": the log gets a [MARK] line, three screenshots of the game
+ * image (now, +1.5 s, +4 s) and, for the first two marks, a dump with the guest's RAM and GPU memory are saved. The game keeps
+ * running. If the session then ends without a crash, the whole debug folder is zipped to the Desktop at exit; a session with
+ * no mark and no crash ends silently.
+ *
  * The log carries, besides the game's own output: a header (build, OS, CPU, memory, display devices,
  * settings), a heartbeat every 5 s (frames presented, memory in use, handles), every controller button and stick
  * change with a timestamp (so the steps that led to a crash can be replayed), first-chance exceptions that are not
@@ -27,6 +32,7 @@
 #include <string.h>
 #include <signal.h>
 #include <psapi.h>
+#include <shlobj.h>
 
 #if defined(__has_include)
 #if __has_include("nhl_debug_tag.h")
@@ -43,6 +49,7 @@
 extern uint64_t nhl_flip_count(void);                    /* backend_d3d11.c */
 extern void nhl_crash_context(PEXCEPTION_POINTERS ep);   /* main.c: guest registers and call chain */
 extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+static void show_banner(const char *title, const char *l2, const char *l3, DWORD ms, COLORREF accent);
 extern ptrdiff_t g_xbox_mem_offset;                       /* host address = guest address + this */
 
 static char s_dir[MAX_PATH];
@@ -125,7 +132,7 @@ static void dump_name(const char *kind, char *out, size_t n)
 
 /* ---- dumps ---------------------------------------------------------------------------------------------- */
 
-struct dump_job { EXCEPTION_POINTERS *ep; DWORD tid; char path[MAX_PATH]; BOOL ok; };
+struct dump_job { EXCEPTION_POINTERS *ep; DWORD tid; char path[MAX_PATH]; BOOL ok; int next; };
 
 /* A full-memory dump of this process is 2.7 GB (the guest address space is mapped in several places). The dump is
  * the normal small kind plus exactly the guest memory that matters: the main 64 MB of RAM and the 64 MB contiguous
@@ -133,14 +140,13 @@ struct dump_job { EXCEPTION_POINTERS *ep; DWORD tid; char path[MAX_PATH]; BOOL o
 static BOOL CALLBACK dump_callback(PVOID ctx, PMINIDUMP_CALLBACK_INPUT in, PMINIDUMP_CALLBACK_OUTPUT out)
 {
     static const ULONG64 guest_ranges[2][2] = { { 0x00000000u, 0x04000000u }, { 0x80000000u, 0x04000000u } };
-    static int next;
-    (void)ctx;
+    int *next_p = (int *)ctx;                     /* per dump: which of the two guest ranges comes next */
     if (in->CallbackType == MemoryCallback) {
-        while (next < 2) {
-            ULONG64 base = (ULONG64)((uintptr_t)g_xbox_mem_offset + guest_ranges[next][0]);
-            ULONG64 size = guest_ranges[next][1];
+        while (*next_p < 2) {
+            ULONG64 base = (ULONG64)((uintptr_t)g_xbox_mem_offset + guest_ranges[*next_p][0]);
+            ULONG64 size = guest_ranges[*next_p][1];
             MEMORY_BASIC_INFORMATION mbi;
-            next++;
+            (*next_p)++;
             if (VirtualQuery((LPCVOID)(uintptr_t)base, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
                     (ULONG64)mbi.RegionSize >= 0x10000) {
                 out->MemoryBase = base;
@@ -161,7 +167,7 @@ static DWORD WINAPI dump_thread(LPVOID p)
     MINIDUMP_CALLBACK_INFORMATION cbi;
     j->ok = FALSE;
     cbi.CallbackRoutine = dump_callback;
-    cbi.CallbackParam = NULL;
+    cbi.CallbackParam = &j->next;
     if (f == INVALID_HANDLE_VALUE) return 0;
     mei.ThreadId = j->tid;
     mei.ExceptionPointers = j->ep;
@@ -181,6 +187,7 @@ static BOOL write_dump(const char *kind, EXCEPTION_POINTERS *ep, char *path_out,
     struct dump_job j;
     HANDLE t;
     j.ep = ep;
+    j.next = 0;
     j.tid = GetCurrentThreadId();
     dump_name(kind, j.path, sizeof j.path);
     t = CreateThread(NULL, 0, dump_thread, &j, 0, NULL);
@@ -215,6 +222,117 @@ static void log_native_stack(const char *why)
     }
 }
 
+/* ---- after the dump: a zip on the Desktop, and a message that is really seen ------------------------------- */
+
+/* tar.exe ships with Windows 10 (1803 and later) and writes a normal zip; it is started and left running, so it
+ * finishes even after the player clicks OK and the game exits. Without it, the collect script is the fallback. */
+static HANDLE start_zip(const char *tag, char *zip_out, size_t n)
+{
+    wchar_t desk[MAX_PATH], sys[MAX_PATH], dir_w[MAX_PATH], zip_w[MAX_PATH + 64], cmd[3 * MAX_PATH + 256];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t stamp_w[32], tag_w[32];
+    HANDLE proc = NULL;
+    zip_out[0] = 0;
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, SHGFP_TYPE_CURRENT, desk))) return NULL;
+    GetSystemDirectoryW(sys, MAX_PATH);
+    MultiByteToWideChar(CP_ACP, 0, s_dir, -1, dir_w, MAX_PATH);
+    MultiByteToWideChar(CP_ACP, 0, s_stamp, -1, stamp_w, 32);
+    MultiByteToWideChar(CP_ACP, 0, tag, -1, tag_w, 32);
+    _snwprintf(zip_w, sizeof zip_w / sizeof zip_w[0], L"%ls\\NHLHitzPro-debug-%ls-%ls.zip", desk, tag_w, stamp_w);
+    WideCharToMultiByte(CP_ACP, 0, zip_w, -1, zip_out, (int)n, "?", NULL);
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    {
+        wchar_t tar[MAX_PATH];
+        _snwprintf(tar, MAX_PATH, L"%ls\\tar.exe", sys);
+        if (GetFileAttributesW(tar) != INVALID_FILE_ATTRIBUTES) {
+            _snwprintf(cmd, sizeof cmd / sizeof cmd[0], L"\"%ls\" -a -c -f \"%ls\" -C \"%ls\" .", tar, zip_w, dir_w);
+        } else {
+            wchar_t exe[MAX_PATH], *sl;
+            GetModuleFileNameW(NULL, exe, MAX_PATH);
+            sl = wcsrchr(exe, L'\\');
+            if (sl) *sl = 0;
+            SetEnvironmentVariableW(L"NHL_COLLECT_QUIET", L"1");
+            _snwprintf(cmd, sizeof cmd / sizeof cmd[0],
+                       L"\"%ls\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File \"%ls\\collect_debug.ps1\"",
+                       sys, exe);
+        }
+    }
+    /* The log is complete: let go of it, so the zip does not race a file that is still being written to (an archive
+     * started on a growing log came out without its directory). Anything printed later goes nowhere. */
+    fprintf(stderr, "[%s] starting the zip of the debug files: %s\n", tag, zip_out);
+    log_flush();
+    freopen("NUL", "w", stderr);
+    freopen("NUL", "w", stdout);
+    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        proc = pi.hProcess;
+    } else {
+        zip_out[0] = 0;
+    }
+    return proc;
+}
+
+/* The game's fullscreen window can sit over an ordinary message box (and the crashed window cannot be asked to step
+ * aside), so the box is shown from its own thread, system-modal and foreground, after the game window has been asked
+ * to minimise without waiting for it. */
+static DWORD WINAPI crash_box_thread(LPVOID text)
+{
+    HWND game = FindWindowA("NhlD3D11Backend", NULL);
+    if (game) {
+        SetWindowPos(game, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        ShowWindowAsync(game, SW_MINIMIZE);
+    }
+    AllowSetForegroundWindow(ASFW_ANY);
+    MessageBoxA(NULL, (const char *)text, "NHL Hitz Pro (debug build)",
+                MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+    return 0;
+}
+
+/* The same kind of box for the end of a session that had marked problems (no crash: an information box). */
+static DWORD WINAPI note_box_thread(LPVOID text)
+{
+    HWND game = FindWindowA("NhlD3D11Backend", NULL);
+    if (game) {
+        SetWindowPos(game, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        ShowWindowAsync(game, SW_MINIMIZE);
+    }
+    AllowSetForegroundWindow(ASFW_ANY);
+    MessageBoxA(NULL, (const char *)text, "NHL Hitz Pro (debug build)",
+                MB_OK | MB_ICONINFORMATION | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST);
+    return 0;
+}
+
+static volatile LONG s_marks;                 /* DEL presses this session */
+
+/* A session that ended on purpose with marked problems: everything goes to one zip on the Desktop. The log is
+ * complete first (the zip must not race a growing file) and the zip is waited for, so the message is true. */
+static void zip_marks_on_exit(void)
+{
+    char zip[MAX_PATH * 2], msg[MAX_PATH * 2 + 300];
+    HANDLE zp, bt;
+    LONG n = s_marks;
+    fprintf(stderr, "[EXIT] t=%.3f %ld issue mark(s) this session: zipping the debug files\n", now_s(), n);
+    log_flush();
+    {
+        char lock[MAX_PATH];
+        snprintf(lock, sizeof lock, "%s\\running.lock", s_dir);
+        DeleteFileA(lock);
+    }
+    show_banner("SAVING DEBUG FILES", "Please wait a moment", "Zipping the log, screenshots and dumps to your Desktop.", 60000, RGB(255, 122, 0));
+    zp = start_zip("marks", zip, sizeof zip);
+    if (zp) { WaitForSingleObject(zp, 180000); CloseHandle(zp); }
+    if (zip[0])
+        snprintf(msg, sizeof msg, "You marked %ld graphical problem(s) this session.\n\nThe debug files were saved to your Desktop:\n%s\n\n"
+                 "Please send that file so they can be fixed.\n\nThe files are also in:\n%s", (long)n, zip, s_dir);
+    else
+        snprintf(msg, sizeof msg, "You marked %ld graphical problem(s) this session.\n\nThe debug files are in:\n%s\n\nPlease zip that "
+                 "whole folder and send it so they can be fixed.", (long)n, s_dir);
+    bt = CreateThread(NULL, 0, note_box_thread, msg, 0, NULL);
+    if (bt) { WaitForSingleObject(bt, INFINITE); CloseHandle(bt); }
+}
+
 static void crash_report(const char *what, EXCEPTION_POINTERS *ep)
 {
     char path[MAX_PATH], msg[MAX_PATH + 300];
@@ -239,10 +357,22 @@ static void crash_report(const char *what, EXCEPTION_POINTERS *ep)
         snprintf(lock, sizeof lock, "%s\\running.lock", s_dir);
         DeleteFileA(lock);
     }
-    snprintf(msg, sizeof msg,
-             "NHL Hitz Pro has crashed.\n\nDebug files were saved in:\n%s\n\nPlease send the whole folder "
-             "(or use the \"Collect debug files\" shortcut in the Start menu) so the problem can be fixed.", s_dir);
-    MessageBoxA(NULL, msg, "NHL Hitz Pro (debug build)", MB_OK | MB_ICONERROR | MB_TOPMOST);
+    {
+        char zip[MAX_PATH * 2];
+        HANDLE bt;
+        { HANDLE zp = start_zip("crash", zip, sizeof zip); if (zp) CloseHandle(zp); }
+        if (zip[0])
+            snprintf(msg, sizeof msg,
+                     "NHL Hitz Pro has crashed.\n\nA zip of the debug files is being saved to your Desktop (it takes a few "
+                     "seconds):\n%s\n\nPlease send that file so the problem can be fixed.\n\nThe files are also in:\n%s", zip, s_dir);
+        else
+            snprintf(msg, sizeof msg,
+                     "NHL Hitz Pro has crashed.\n\nDebug files were saved in:\n%s\n\nPlease zip that whole folder and send it "
+                     "so the problem can be fixed.", s_dir);
+        bt = CreateThread(NULL, 0, crash_box_thread, msg, 0, NULL);
+        if (bt) { WaitForSingleObject(bt, INFINITE); CloseHandle(bt); }
+        else MessageBoxA(NULL, msg, "NHL Hitz Pro (debug build)", MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_TOPMOST);
+    }
 }
 
 static LONG WINAPI unhandled_filter(EXCEPTION_POINTERS *ep)
@@ -314,6 +444,7 @@ static void at_exit(void)
         snprintf(lock, sizeof lock, "%s\\running.lock", s_dir);
         DeleteFileA(lock);
     }
+    if (s_marks) zip_marks_on_exit();
 }
 
 /* ---- monitor thread: heartbeat and hang detection ------------------------------------------------------- */
@@ -483,6 +614,122 @@ static void print_header(void)
     fprintf(stderr, "================================\n");
 }
 
+/* ---- start-up banner: confirms this is the debug build ----------------------------------------------------- */
+
+struct banner_args { char title[48], l2[120], l3[360]; DWORD ms; COLORREF accent; };
+
+static LRESULT CALLBACK banner_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_TIMER) { DestroyWindow(h); return 0; }
+    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    if (m == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    return DefWindowProcA(h, m, w, l);
+}
+
+/* Its own window on its own thread, so it is up at once (the game's window comes much later) and over the game
+ * whatever mode that is in; it takes no input and goes away by itself after five seconds. */
+static DWORD WINAPI banner_thread(LPVOID arg)
+{
+    struct banner_args *ba = (struct banner_args *)arg;
+    WNDCLASSA wc;
+    HWND hw;
+    int dpi = 96, w, h, x, y, i, bw;
+    BITMAPINFO bi;
+    void *bits = NULL;
+    HDC sdc, mdc;
+    HBITMAP bm;
+    HGDIOBJ oldbm, oldf;
+    HFONT f1, f2, f3;
+    uint32_t *px;
+    RECT r;
+    HBRUSH br;
+    BLENDFUNCTION bf;
+    POINT p0 = { 0, 0 }, pos;
+    SIZE sz;
+    MSG msg;
+
+    {
+        typedef UINT (WINAPI *dpi_fn)(void);
+        HMODULE u = GetModuleHandleA("user32.dll");
+        dpi_fn f = u ? (dpi_fn)(void *)GetProcAddress(u, "GetDpiForSystem") : NULL;
+        if (f) dpi = (int)f();
+    }
+    w = 680 * dpi / 96; h = 215 * dpi / 96;
+    x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    y = GetSystemMetrics(SM_CYSCREEN) / 8;
+    memset(&wc, 0, sizeof wc);
+    wc.lpfnWndProc = banner_proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "NhlDebugBanner";
+    RegisterClassA(&wc);
+    hw = CreateWindowExA(WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+                         wc.lpszClassName, "", WS_POPUP, x, y, w, h, NULL, NULL, wc.hInstance, NULL);
+    if (!hw) { free(ba); return 0; }
+
+    memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bm = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!bm || !bits) { DestroyWindow(hw); DeleteDC(mdc); ReleaseDC(NULL, sdc); return 0; }
+    oldbm = SelectObject(mdc, bm);
+    SetRect(&r, 0, 0, w, h);
+    br = CreateSolidBrush(ba->accent); FillRect(mdc, &r, br); DeleteObject(br);
+    bw = 4 * dpi / 96;
+    InflateRect(&r, -bw, -bw);
+    br = CreateSolidBrush(RGB(14, 22, 40)); FillRect(mdc, &r, br); DeleteObject(br);
+    SetBkMode(mdc, TRANSPARENT);
+    f1 = CreateFontA(-(46 * dpi / 96), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+    f2 = CreateFontA(-(26 * dpi / 96), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+    f3 = CreateFontA(-(17 * dpi / 96), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, "Segoe UI");
+    oldf = SelectObject(mdc, f1);
+    SetTextColor(mdc, ba->accent);
+    SetRect(&r, 0, 18 * dpi / 96, w, 76 * dpi / 96);
+    DrawTextA(mdc, ba->title, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mdc, f2);
+    SetTextColor(mdc, RGB(255, 255, 255));
+    SetRect(&r, 0, 80 * dpi / 96, w, 116 * dpi / 96);
+    DrawTextA(mdc, ba->l2, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mdc, f3);
+    SetTextColor(mdc, RGB(200, 210, 225));
+    SetRect(&r, 12 * dpi / 96, 122 * dpi / 96, w - 12 * dpi / 96, 205 * dpi / 96);
+    DrawTextA(mdc, ba->l3, -1, &r, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS);
+    SelectObject(mdc, oldf);
+    DeleteObject(f1); DeleteObject(f2); DeleteObject(f3);
+    GdiFlush();
+    px = (uint32_t *)bits;
+    for (i = 0; i < w * h; i++) px[i] |= 0xFF000000u;            /* fully opaque */
+
+    pos.x = x; pos.y = y;
+    sz.cx = w; sz.cy = h;
+    bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0; bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
+    UpdateLayeredWindow(hw, sdc, &pos, &sz, mdc, &p0, 0, &bf, ULW_ALPHA);
+    ShowWindow(hw, SW_SHOWNOACTIVATE);
+    SetWindowPos(hw, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetTimer(hw, 1, ba->ms, NULL);
+    fprintf(stderr, "[DEBUG] banner \"%s\" shown for %lu ms\n", ba->title, (unsigned long)ba->ms);
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
+    SelectObject(mdc, oldbm);
+    DeleteObject(bm); DeleteDC(mdc); ReleaseDC(NULL, sdc);
+    free(ba);
+    return 0;
+}
+
+static void show_banner(const char *title, const char *l2, const char *l3, DWORD ms, COLORREF accent)
+{
+    struct banner_args *ba = (struct banner_args *)calloc(1, sizeof *ba);
+    if (!ba) return;
+    snprintf(ba->title, sizeof ba->title, "%s", title);
+    snprintf(ba->l2, sizeof ba->l2, "%s", l2);
+    snprintf(ba->l3, sizeof ba->l3, "%s", l3);
+    ba->ms = ms;
+    ba->accent = accent;
+    CloseHandle(CreateThread(NULL, 0, banner_thread, ba, 0, NULL));
+}
+
 /* ---- entry point ---------------------------------------------------------------------------------------- */
 
 void nhl_debug_init(void)
@@ -528,6 +775,11 @@ void nhl_debug_init(void)
     _set_purecall_handler(purecall);
     atexit(at_exit);
 
+    {
+        char l3[MAX_PATH + 160];
+        snprintf(l3, sizeof l3, "Logging and crash capture are ON. Press DEL in the game when you see a graphical glitch.\nFiles: %s", s_dir);
+        show_banner("DEBUG BUILD", "NHL Hitz Pro " NHL_DEBUG_TAG, l3, 5000, RGB(255, 122, 0));
+    }
     CreateThread(NULL, 0, monitor_thread, NULL, 0, NULL);
     CreateThread(NULL, 0, pad_thread, NULL, 0, NULL);
 }
@@ -544,6 +796,83 @@ void nhl_debug_note_exit(const char *why)
         snprintf(lock, sizeof lock, "%s\\running.lock", s_dir);
         DeleteFileA(lock);
     }
+    if (s_marks) zip_marks_on_exit();
+}
+
+/* ---- DEL: mark a graphical problem ------------------------------------------------------------------------ */
+
+#define MARK_DUMPS 2             /* dumps are ~200 MB: only the first marks get one */
+
+static struct { ULONGLONG due; char path[MAX_PATH]; } s_caps[24];
+static volatile LONG s_cap_lock;
+
+static void cap_lock(void) { while (InterlockedCompareExchange(&s_cap_lock, 1, 0)) SwitchToThread(); }
+static void cap_unlock(void) { InterlockedExchange(&s_cap_lock, 0); }
+
+/* The renderer asks every frame: a screenshot path (without extension) that is due, if any. */
+int nhl_debug_capture_due(char *path, size_t n)
+{
+    int i, got = 0;
+    if (!s_marks) return 0;
+    cap_lock();
+    for (i = 0; i < 24 && !got; i++)
+        if (s_caps[i].path[0] && GetTickCount64() >= s_caps[i].due) {
+            snprintf(path, n, "%s", s_caps[i].path);
+            s_caps[i].path[0] = 0;
+            got = 1;
+        }
+    cap_unlock();
+    return got;
+}
+
+struct mark_job { LONG n; };
+
+static DWORD WINAPI mark_worker(LPVOID p)
+{
+    struct mark_job *j = (struct mark_job *)p;
+    char path[MAX_PATH], kind[16];
+    Sleep(700);                                    /* the first screenshot is taken by then */
+    snprintf(kind, sizeof kind, "mark%ld", (long)j->n);
+    if (j->n <= MARK_DUMPS) {
+        BOOL ok = write_dump(kind, NULL, path, sizeof path);
+        fprintf(stderr, "[MARK] #%ld dump %s: %s\n", (long)j->n, ok ? "written" : "FAILED", path);
+    }
+    free(j);
+    return 0;
+}
+
+void nhl_debug_mark(void)
+{
+    static ULONGLONG last;
+    ULONGLONG t = GetTickCount64();
+    LONG n;
+    int i, k;
+    static const DWORD delays[3] = { 0, 1500, 4000 };
+    char l2[96], base[MAX_PATH];
+    struct mark_job *j;
+    if (s_crashing || t - last < 700) return;       /* a held key or a double press counts once */
+    last = t;
+    n = InterlockedIncrement(&s_marks);
+    fprintf(stderr, "[MARK] #%ld t=%.3f frames=%llu: DEL pressed, a graphical problem is here (screenshots mark%ld_*.bmp, dump mark%ld_*.dmp)\n",
+            (long)n, now_s(), (unsigned long long)nhl_flip_count(), (long)n, (long)n);
+    cap_lock();
+    for (k = 0; k < 3; k++) {
+        for (i = 0; i < 24 && s_caps[i].path[0]; i++)
+            ;
+        if (i == 24) break;
+        snprintf(base, sizeof base, "%s\\mark%ld_%s_%d", s_dir, (long)n, s_stamp, k + 1);
+        snprintf(s_caps[i].path, sizeof s_caps[i].path, "%s", base);
+        s_caps[i].due = t + delays[k];
+    }
+    cap_unlock();
+    j = (struct mark_job *)malloc(sizeof *j);
+    if (j) {
+        j->n = n;
+        CloseHandle(CreateThread(NULL, 0, mark_worker, j, 0, NULL));
+    }
+    snprintf(l2, sizeof l2, "Issue #%ld marked at %.0f s", (long)n, now_s());
+    show_banner("MARKED", l2, "Saving screenshots and info. Keep playing: the debug files are zipped to your Desktop when you quit.",
+                2800, RGB(80, 200, 120));
 }
 
 #endif /* NHL_DEBUGLOG */

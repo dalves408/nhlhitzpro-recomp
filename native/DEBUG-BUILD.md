@@ -14,6 +14,13 @@ Files go to `%LOCALAPPDATA%\NHLHitzPro\debug`:
 - `hang_<date>.dmp`: no frame presented for 15 s (at most 2 per run).
 - `running.lock`: present while running; seen at the next start it logs `[PREV]` (the last session did not end cleanly).
 
+**DEL marks a graphical problem.** Press DEL in the game window when something looks wrong (the game never sees the key):
+the log gets a `[MARK]` line with the time and frame count, three screenshots of the game image are saved (now, +1.5 s, +4 s:
+`mark<n>_<date>_<k>.bmp`) and the first two marks also get a dump (`mark<n>_<date>.dmp`, with the guest RAM and GPU window). The
+game keeps running and the crash monitoring stays on. A session that ends normally with at least one mark is zipped to the
+Desktop on exit (`NHLHitzPro-debug-marks-<date>.zip`, waited for, then a message says where it is); a session with no mark and no
+crash ends silently. Crashes zip as before.
+
 The installer adds a Start menu shortcut "Collect debug files" (`collect_debug.ps1`) that zips the folder to the Desktop.
 
 ## Build (own build directory, never build-release)

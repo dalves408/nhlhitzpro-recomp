@@ -60,9 +60,15 @@ Source: "collect_debug.ps1"; DestDir: "{app}"; Flags: ignoreversion
 #endif
 
 [Icons]
+#ifdef DebugBuild
+Name: "{autoprograms}\NHL Hitz Pro - Debug"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\NHL Hitz Pro Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\NHL Hitz Pro - Debug"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+#else
 Name: "{autoprograms}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"
 Name: "{autoprograms}\NHL Hitz Pro Settings"; Filename: "{app}\config.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\NHL Hitz Pro"; Filename: "{app}\nhl_hitz_pro_recomp.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+#endif
 #ifdef DebugBuild
 Name: "{autoprograms}\NHL Hitz Pro - Collect debug files"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\collect_debug.ps1"""; WorkingDir: "{app}"
 #endif
