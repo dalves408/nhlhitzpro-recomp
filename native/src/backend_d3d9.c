@@ -975,33 +975,90 @@ static size_t tex_span(const Nv2aTexture *t)
 typedef HRESULT (WINAPI *PFN_D3DCOMPILE_)(LPCVOID, SIZE_T, LPCSTR, const void *, void *, LPCSTR, LPCSTR,
                                           UINT, UINT, ID3DBlob **, ID3DBlob **);
 static PFN_D3DCOMPILE_ s_D3DCompile;
+/* The D3DX9 compiler: ID3DXBuffer has the same layout as ID3DBlob (IUnknown, GetBufferPointer, GetBufferSize), so
+ * the code below treats both alike. */
+typedef HRESULT (WINAPI *PFN_D3DXCOMPILESHADER_)(LPCSTR, UINT, const void *, void *, LPCSTR, LPCSTR, DWORD,
+                                                 ID3DBlob **, ID3DBlob **, void **);
+static PFN_D3DXCOMPILESHADER_ s_D3DXCompile;
 
+static HMODULE load_beside_or_system(const char *name)
+{
+    char path[MAX_PATH + 32], *slash;
+    HMODULE m = NULL;
+    if (GetModuleFileNameA(NULL, path, MAX_PATH) && (slash = strrchr(path, '\\')) != NULL) {
+        strcpy(slash + 1, name);
+        m = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+    }
+    return m ? m : LoadLibraryA(name);
+}
+
+/* Where the game's shader compiler comes from, best first.
+ *
+ *   Windows 7 and later: d3dcompiler_47.dll (ships with Windows 10; beside the exe on 7).
+ *   Windows XP: d3dcompiler_47.dll needs functions XP lacks and would pop an "Entry Point Not Found" box, so there
+ *   are no error boxes for these loads. d3dcompiler_43.dll (the June 2010 DirectX runtime) goes first, then the D3DX9
+ *   DLLs, newest first: they hold the same compiler behind D3DXCompileShader, and a PC that ran any DirectX 9 game
+ *   usually has one (the probe logs of eight XP laptops: three had no d3dcompiler_43 and two of those had d3dx9_28 /
+ *   d3dx9_35). An old D3DX can fail on longer programs, so the game's folder should carry d3dcompiler_43.dll or
+ *   d3dx9_43.dll; both are found beside the exe before the system folders.
+ * RECOMP_SHADER_COMPILER=d3dx forces the D3DX route (testing), =d3dcompiler skips it. */
 static int load_compiler(void)
 {
     static int tried;
+    static const char *const x_names[] = { "d3dx9_43.dll", "d3dx9_42.dll", "d3dx9_41.dll", "d3dx9_40.dll", "d3dx9_39.dll",
+                                           "d3dx9_38.dll", "d3dx9_37.dll", "d3dx9_36.dll", "d3dx9_35.dll", "d3dx9_34.dll",
+                                           "d3dx9_33.dll", "d3dx9_32.dll", "d3dx9_31.dll", "d3dx9_30.dll", "d3dx9_29.dll",
+                                           "d3dx9_28.dll" };
+    static const char *const names[2][2] = { { "d3dcompiler_47.dll", "d3dcompiler_43.dll" },
+                                             { "d3dcompiler_43.dll", "d3dcompiler_47.dll" } };
     HMODULE m = NULL;
-    char path[MAX_PATH + 32], *slash;
-    if (tried) return s_D3DCompile != NULL;
+    UINT old_mode;
+    int xp, k;
+    const char *force = getenv("RECOMP_SHADER_COMPILER");
+    if (tried) return s_D3DCompile != NULL || s_D3DXCompile != NULL;
     tried = 1;
-    {
-        /* Windows XP: d3dcompiler_47.dll needs functions XP lacks and would pop an "Entry Point Not Found" box, so no error
-         * boxes for these loads, and on XP try the June 2010 runtime's d3dcompiler_43.dll first (beside the exe, then the system). */
-        UINT old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
-        int xp = (GetVersion() & 0xFF) < 6, k;
-        static const char *const names[2][2] = { { "d3dcompiler_47.dll", "d3dcompiler_43.dll" },
-                                                 { "d3dcompiler_43.dll", "d3dcompiler_47.dll" } };
+    old_mode = SetErrorMode(SEM_FAILCRITICALERRORS);
+    xp = (GetVersion() & 0xFF) < 6;
+    if (!(force && !strcmp(force, "d3dx"))) {
         for (k = 0; k < 2 && !m; k++) {
-            if (GetModuleFileNameA(NULL, path, MAX_PATH) && (slash = strrchr(path, '\\')) != NULL) {
-                strcpy(slash + 1, names[xp][k]);
-                m = LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+            m = load_beside_or_system(names[xp][k]);
+            if (m) {
+                s_D3DCompile = (PFN_D3DCOMPILE_)(void *)GetProcAddress(m, "D3DCompile");
+                if (s_D3DCompile) logf_("shader compiler: %s\n", names[xp][k]);
+                else { FreeLibrary(m); m = NULL; }
             }
-            if (!m) m = LoadLibraryA(names[xp][k]);
         }
-        SetErrorMode(old_mode);
     }
-    if (m) s_D3DCompile = (PFN_D3DCOMPILE_)(void *)GetProcAddress(m, "D3DCompile");
-    if (!s_D3DCompile) logf_("no shader compiler (d3dcompiler_47.dll / d3dcompiler_43.dll) found\n");
-    return s_D3DCompile != NULL;
+    if (!s_D3DCompile && !(force && !strcmp(force, "d3dcompiler"))) {
+        for (k = 0; k < (int)(sizeof x_names / sizeof x_names[0]) && !s_D3DXCompile; k++) {
+            m = load_beside_or_system(x_names[k]);
+            if (!m) continue;
+            s_D3DXCompile = (PFN_D3DXCOMPILESHADER_)(void *)GetProcAddress(m, "D3DXCompileShader");
+            if (s_D3DXCompile) logf_("shader compiler: %s (D3DXCompileShader)\n", x_names[k]);
+            else FreeLibrary(m);
+        }
+    }
+    SetErrorMode(old_mode);
+    if (!s_D3DCompile && !s_D3DXCompile)
+        logf_("no shader compiler (d3dcompiler_47/43.dll or d3dx9_xx.dll) found: put d3dcompiler_43.dll or d3dx9_43.dll beside the exe\n");
+    return s_D3DCompile != NULL || s_D3DXCompile != NULL;
+}
+
+/* Instruction slots of a compiled D3D9 shader (the longest program decides what an older card can take; Radeon X1300:
+ * 512 pixel shader slots). Counts every instruction token that is not a comment, def or dcl. */
+static unsigned shader_slots(const DWORD *t, size_t dwords)
+{
+    size_t i = 1;
+    unsigned n = 0;
+    while (i < dwords) {
+        DWORD op = t[i] & 0xFFFFu, len = (t[i] >> 24) & 0xFu;
+        if (op == 0xFFFFu) break;                               /* end */
+        if (op == 0xFFFEu) { i += 1 + ((t[i] >> 16) & 0x7FFFu); continue; }   /* comment */
+        if (op != 0x1F && op != 0x51 && op != 0x30 && op != 0x2F)   /* not dcl, def, defi, defb */
+            n++;
+        i += 1 + len;
+    }
+    return n;
 }
 
 static ID3DBlob *compile_src(const char *src, size_t len, const char *entry, const char *target)
@@ -1009,11 +1066,22 @@ static ID3DBlob *compile_src(const char *src, size_t len, const char *entry, con
     ID3DBlob *code = NULL, *err = NULL;
     HRESULT hr;
     if (!load_compiler()) return NULL;
-    hr = s_D3DCompile(src, len, "d3d9_backend.hlsl", NULL, NULL, entry, target, 1u << 15 /* optimisation level 3 */, 0, &code, &err);
+    if (s_D3DCompile)
+        hr = s_D3DCompile(src, len, "d3d9_backend.hlsl", NULL, NULL, entry, target, 1u << 15 /* optimisation level 3 */, 0, &code, &err);
+    else
+        hr = s_D3DXCompile(src, (UINT)len, NULL, NULL, entry, target, 1u << 15, &code, &err, NULL);
     if (FAILED(hr)) {
-        logf_("D3DCompile %s failed 0x%08lX: %s\n", entry, (unsigned long)hr,
+        logf_("shader compile %s failed 0x%08lX: %s\n", entry, (unsigned long)hr,
               err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
         code = NULL;
+    } else if (code) {
+        static unsigned max_ps, max_vs;
+        unsigned n = shader_slots((const DWORD *)ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code) / 4);
+        unsigned *mx = target[0] == 'p' ? &max_ps : &max_vs;
+        if (n > *mx) {
+            *mx = n;
+            logf_("longest %s so far: %u instruction slots (%s)\n", target, n, entry);
+        }
     }
     if (err) ID3D10Blob_Release(err);
     return code;
