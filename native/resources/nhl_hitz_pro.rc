@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "dalves408/nhlhitzpro-recomp"
             VALUE "FileDescription", "NHL Hitz Pro recompilation project"
-            VALUE "FileVersion", "1.0.6.0"
+            VALUE "FileVersion", "1.0.7.0"
             VALUE "InternalName", "nhl_hitz_pro_recomp"
             VALUE "LegalCopyright", "Fan-made recompilation. Game assets are not included."
             VALUE "OriginalFilename", "nhl_hitz_pro_recomp.exe"
             VALUE "ProductName", "NHL Hitz Pro"
-            VALUE "ProductVersion", "1.0.6.0"
+            VALUE "ProductVersion", "1.0.7.0"
         END
     END
     BLOCK "VarFileInfo"

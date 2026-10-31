@@ -5,7 +5,7 @@
 ; then compile this script with ISCC.exe. Output: native\installer\Output\NHLHitzPro-Setup-<version>.exe
 ; If the game is already installed (its game files are in place), Setup only updates the program files:
 ; it does not ask for the disc and does not copy the 1.5 GB of game files again.
-#define AppVersion "1.0.6"
+#define AppVersion "1.0.7"
 #include "pack_version.iss"
 #include "pack_release.iss"
 #define BuildDir "..\build-release\Release"
