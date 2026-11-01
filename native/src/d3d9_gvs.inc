@@ -271,6 +271,7 @@ static int gvs_draw_slow(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const 
 {
     GvsSpec *sp = gvs_find(gv);
     uint32_t att[16], na = 0, i, stride, done = 0, nidx = gv->nidx, per;
+    s_gvs_bound = 0;
     float cst[3][4];
     uint64_t tf0;
 
@@ -321,7 +322,66 @@ static int gvs_draw_slow(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const 
 }
 
 /* ---- fast path: decode each distinct vertex once (attribute by attribute, into cacheable memory), then draw indexed ---- */
-typedef struct { uint32_t off, stride; uint8_t ty, sz, cnst; float imm[4]; } GvsAttr;
+typedef struct { uint32_t off, stride; uint8_t ty, sz, cnst; float imm[4]; uint8_t idx, dtype, nb; uint16_t doff; } GvsAttr;
+
+/* Vertex elements in the format the game stored them, so the CPU only copies bytes and the GPU converts: float1-4,
+ * D3DCOLOR, UBYTE4N, SHORT2/4 (N). Anything else (and attributes whose missing components are not the D3D default
+ * 0,0,0,1) stays float4, converted on the CPU. dtype 0xFF = float4 via the converting path. */
+static uint32_t s_fmt_verts[8][5], s_fmt_float4_verts;
+static void gvs_classify(GvsAttr *a)
+{
+    const float *m = a->imm;
+    int d0 = (m[0] == 0.0f), d1 = (m[1] == 0.0f), d2 = (m[2] == 0.0f), d3 = (m[3] == 1.0f);
+    a->dtype = 0xFF; a->nb = 16;
+    if (a->cnst) return;
+    switch (a->ty) {
+    case 2:
+        if (a->sz == 4) { a->dtype = D3DDECLTYPE_FLOAT4; a->nb = 16; }
+        else if (a->sz == 3 && d3) { a->dtype = D3DDECLTYPE_FLOAT3; a->nb = 12; }
+        else if (a->sz == 2 && d2 && d3) { a->dtype = D3DDECLTYPE_FLOAT2; a->nb = 8; }
+        else if (a->sz == 1 && d1 && d2 && d3) { a->dtype = D3DDECLTYPE_FLOAT1; a->nb = 4; }
+        break;
+    case 0: a->dtype = D3DDECLTYPE_D3DCOLOR; a->nb = 4; break;
+    case 4:
+        if (a->sz == 4 && (g.caps.DeclTypes & D3DDTCAPS_UBYTE4N)) { a->dtype = D3DDECLTYPE_UBYTE4N; a->nb = 4; }
+        break;
+    case 1:
+        if (a->sz == 2 && d2 && d3 && (g.caps.DeclTypes & D3DDTCAPS_SHORT2N)) { a->dtype = D3DDECLTYPE_SHORT2N; a->nb = 4; }
+        else if (a->sz == 4 && (g.caps.DeclTypes & D3DDTCAPS_SHORT4N)) { a->dtype = D3DDECLTYPE_SHORT4N; a->nb = 8; }
+        break;
+    case 5:
+        if (a->sz == 2 && d2 && d3) { a->dtype = D3DDECLTYPE_SHORT2; a->nb = 4; }
+        else if (a->sz == 4) { a->dtype = D3DDECLTYPE_SHORT4; a->nb = 8; }
+        break;
+    default: break;
+    }
+}
+
+#define GVS_DECL_MAX 128
+static struct { uint32_t mask; uint8_t t[16]; IDirect3DVertexDeclaration9 *decl; } s_gdecl[GVS_DECL_MAX];
+static int s_ngdecl;
+
+static IDirect3DVertexDeclaration9 *gvs_decl_for(const GvsAttr *at, uint32_t na)
+{
+    uint32_t k, mask = 0;
+    uint8_t t[16];
+    D3DVERTEXELEMENT9 el[17];
+    D3DVERTEXELEMENT9 end = D3DDECL_END();
+    int i;
+    memset(t, 0, sizeof t);
+    for (k = 0; k < na; k++) { mask |= 1u << at[k].idx; t[at[k].idx] = at[k].dtype == 0xFF ? (uint8_t)D3DDECLTYPE_FLOAT4 : at[k].dtype; }
+    for (i = 0; i < s_ngdecl; i++)
+        if (s_gdecl[i].mask == mask && !memcmp(s_gdecl[i].t, t, sizeof t)) return s_gdecl[i].decl;
+    if (s_ngdecl >= GVS_DECL_MAX) return NULL;
+    for (k = 0; k < na; k++) {
+        el[k].Stream = 0; el[k].Offset = at[k].doff; el[k].Type = (BYTE)t[at[k].idx];
+        el[k].Method = D3DDECLMETHOD_DEFAULT; el[k].Usage = D3DDECLUSAGE_TEXCOORD; el[k].UsageIndex = at[k].idx;
+    }
+    el[na] = end;
+    if (FAILED(IDirect3DDevice9_CreateVertexDeclaration(g.dev, el, &s_gdecl[s_ngdecl].decl))) return NULL;
+    s_gdecl[s_ngdecl].mask = mask; memcpy(s_gdecl[s_ngdecl].t, t, sizeof t);
+    return s_gdecl[s_ngdecl++].decl;
+}
 
 static float *s_gscratch;
 static size_t s_gscratch_cap;                 /* floats */
@@ -338,55 +398,58 @@ static uint32_t gvs_elem_bytes(const GvsAttr *a)
     }
 }
 
-/* 0 if some read would leave the block (the caller then takes the checked per-vertex path) */
-static int gvs_decode_range(const Nv2aGpuVs *gv, const GvsAttr *at, uint32_t na, uint32_t vmin, uint32_t n, float *out)
+/* 0 if some read would leave the block (the caller then takes the checked per-vertex path). out: n vertices of S bytes. */
+static int gvs_decode_range(const Nv2aGpuVs *gv, const GvsAttr *at, uint32_t na, uint32_t vmin, uint32_t n, uint8_t *out, uint32_t S)
 {
-    uint32_t k, i, S = 4u * na;
+    uint32_t k, i;
     for (k = 0; k < na; k++) {
         const GvsAttr *a = &at[k];
-        float *o = out + 4u * k;
+        uint8_t *o = out + a->doff;
         if (a->cnst) {
-            for (i = 0; i < n; i++, o += S) { o[0] = a->imm[0]; o[1] = a->imm[1]; o[2] = a->imm[2]; o[3] = a->imm[3]; }
+            for (i = 0; i < n; i++, o += S) memcpy(o, a->imm, 16);
         } else {
             uint32_t a0 = a->off + vmin * a->stride, el = gvs_elem_bytes(a), sz = a->sz;
             const uint8_t *p;
             if (!el || (uint64_t)a0 + (uint64_t)(n - 1) * a->stride + el > gv->block_bytes) return 0;
             p = gv->block + a0;
+            if (a->dtype != 0xFF) {                     /* the game's own bytes */
+                switch (a->nb) {
+                case 4:  for (i = 0; i < n; i++, o += S, p += a->stride) memcpy(o, p, 4); break;
+                case 8:  for (i = 0; i < n; i++, o += S, p += a->stride) memcpy(o, p, 8); break;
+                case 12: for (i = 0; i < n; i++, o += S, p += a->stride) memcpy(o, p, 12); break;
+                default: for (i = 0; i < n; i++, o += S, p += a->stride) memcpy(o, p, 16); break;
+                }
+                continue;
+            }
             switch (a->ty) {
             case 2:
                 for (i = 0; i < n; i++, o += S, p += a->stride) {
-                    memcpy(o, p, 4u * sz);
-                    if (sz < 4) memcpy(o + sz, a->imm + sz, 4u * (4u - sz));
-                }
-                break;
-            case 0:
-                for (i = 0; i < n; i++, o += S, p += a->stride) {
-                    uint32_t v; memcpy(&v, p, 4);
-                    o[0] = (float)((v >> 16) & 255u) * (1.0f / 255.0f); o[1] = (float)((v >> 8) & 255u) * (1.0f / 255.0f);
-                    o[2] = (float)(v & 255u) * (1.0f / 255.0f);          o[3] = (float)(v >> 24) * (1.0f / 255.0f);
+                    float *f = (float *)o;
+                    memcpy(f, p, 4u * sz);
+                    if (sz < 4) memcpy(f + sz, a->imm + sz, 4u * (4u - sz));
                 }
                 break;
             case 4:
                 for (i = 0; i < n; i++, o += S, p += a->stride) {
-                    uint32_t c;
-                    for (c = 0; c < 4; c++) o[c] = c < sz ? (float)p[c] * (1.0f / 255.0f) : a->imm[c];
+                    float *f = (float *)o; uint32_t c;
+                    for (c = 0; c < 4; c++) f[c] = c < sz ? (float)p[c] * (1.0f / 255.0f) : a->imm[c];
                 }
                 break;
             case 1: case 5: {
                 float sc = a->ty == 1 ? 1.0f / 32767.0f : 1.0f;
                 for (i = 0; i < n; i++, o += S, p += a->stride) {
-                    uint32_t c;
+                    float *f = (float *)o; uint32_t c;
                     for (c = 0; c < 4; c++) {
                         int16_t v;
-                        if (c < sz) { memcpy(&v, p + 2u * c, 2); o[c] = (float)v * sc; } else o[c] = a->imm[c];
+                        if (c < sz) { memcpy(&v, p + 2u * c, 2); f[c] = (float)v * sc; } else f[c] = a->imm[c];
                     }
                 }
                 break; }
             case 6:
                 for (i = 0; i < n; i++, o += S, p += a->stride) {
-                    uint32_t v; memcpy(&v, p, 4);
-                    o[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f; o[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
-                    o[2] = (float)((int32_t)v >> 22) / 511.0f;          o[3] = 1.0f;
+                    float *f = (float *)o; uint32_t v; memcpy(&v, p, 4);
+                    f[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f; f[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+                    f[2] = (float)((int32_t)v >> 22) / 511.0f;          f[3] = 1.0f;
                 }
                 break;
             default: return 0;
@@ -408,6 +471,7 @@ static int gvs_draw(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const Rende
     uint16_t *ip;
     float *vp;
     DWORD fl;
+    IDirect3DVertexDeclaration9 *dcl;
 
     if (!sp || !gv->block || !nidx) return 0;
     if ((uint64_t)GVS_OFF_IDX + (uint64_t)nidx * 4u > gv->block_bytes) return 0;
@@ -415,7 +479,7 @@ static int gvs_draw(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const Rende
     for (i = 0; i < nidx; i++) { uint32_t v = idx[i]; if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
     range = vmax - vmin + 1u;
     if (range > 65536u || range > nidx * 4u + 64u || !s_gib) return gvs_draw_slow(gv, rs_, r, zscale);
-    if (!sp->decl && !gvs_create_decl(sp)) return 0;
+    stride = 0;
     for (i = 0; i < 16; i++)
         if ((sp->mask >> i) & 1u) {
             const uint32_t *d = (const uint32_t *)(gv->block + GVS_OFF_ATTR) + i * 4u;
@@ -423,9 +487,15 @@ static int gvs_draw(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const Rende
             a->off = d[0]; a->stride = d[1]; a->ty = (uint8_t)(d[2] & 255u); a->sz = (uint8_t)(d[2] >> 8); a->cnst = d[3] != 0;
             if (a->sz > 4) a->sz = 4;
             memcpy(a->imm, (const float *)(gv->block + GVS_OFF_IMM) + i * 4u, 16);
+            a->idx = (uint8_t)i;
+            gvs_classify(a);
+            a->doff = (uint16_t)stride;
+            stride += a->nb;
+            if (!a->cnst) { if (a->dtype == 0xFF) s_fmt_float4_verts += nidx; else if (a->ty < 8 && a->sz < 5) s_fmt_verts[a->ty][a->sz] += nidx; }
         }
-    stride = 16u * na;
     if (!stride) return 0;
+    dcl = gvs_decl_for(at, na);
+    if (!dcl) return gvs_draw_slow(gv, rs_, r, zscale);
     if ((uint64_t)range * stride > GVS_VB_BYTES) return gvs_draw_slow(gv, rs_, r, zscale);
     if ((size_t)range * na * 4u > s_gscratch_cap) {
         free(s_gscratch);
@@ -434,8 +504,10 @@ static int gvs_draw(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const Rende
         if (!s_gscratch) { s_gscratch_cap = 0; return 0; }
     }
     tf0 = qpc_us();
-    if (!gvs_decode_range(gv, at, na, vmin, range, s_gscratch)) return gvs_draw_slow(gv, rs_, r, zscale);
+    if (!gvs_decode_range(gv, at, na, vmin, range, (uint8_t *)s_gscratch, stride)) return gvs_draw_slow(gv, rs_, r, zscale);
     s_us_fetch += qpc_us() - tf0;
+    pf.g_decode += qpc_us() - tf0;
+    tf0 = qpc_us();
 
     /* the vertices */
     if (s_gvb_off + range * stride > GVS_VB_BYTES) { s_gvb_off = 0; fl = D3DLOCK_DISCARD; }
@@ -451,23 +523,41 @@ static int gvs_draw(const Nv2aGpuVs *gv, const Nv2aRenderState *rs_, const Rende
     if (FAILED(IDirect3DIndexBuffer9_Lock(s_gib, s_gib_off * 2u, nidx * 2u, (void **)&ip, fl))) return 0;
     for (i = 0; i < nidx; i++) ip[i] = (uint16_t)(idx[i] - vmin);
     IDirect3DIndexBuffer9_Unlock(s_gib);
+    { uint64_t n_ = qpc_us(); pf.g_lock += n_ - tf0; tf0 = n_; }
 
     cst[0][0] = (float)r->w; cst[0][1] = (float)r->h; cst[0][2] = zscale; cst[0][3] = 0.0f;
     cst[1][0] = gv->aa_sx ? gv->aa_sx : 1.0f; cst[1][1] = gv->aa_sy ? gv->aa_sy : 1.0f;
     cst[1][2] = (float)gv->fog_mode; cst[1][3] = 0.0f;
     cst[2][0] = gv->fog_px; cst[2][1] = gv->fog_py; cst[2][2] = cst[2][3] = 0.0f;
-    if (!s_vc_valid || memcmp(lastc, gv->block, sizeof lastc)) {         /* program constants: usually unchanged between draws */
+    if (!s_vc_valid) {                                                    /* program constants: only the registers that changed */
         IDirect3DDevice9_SetVertexShaderConstantF(g.dev, 0, (const float *)gv->block, 192);
         memcpy(lastc, gv->block, sizeof lastc);
         s_vc_valid = 1;
+    } else {
+        const uint32_t *a = (const uint32_t *)lastc, *b = (const uint32_t *)gv->block;
+        int lo = -1, hi = -1, k;
+        for (k = 0; k < 192; k++)
+            if (a[4 * k] != b[4 * k] || a[4 * k + 1] != b[4 * k + 1] || a[4 * k + 2] != b[4 * k + 2] || a[4 * k + 3] != b[4 * k + 3]) {
+                if (lo < 0) lo = k;
+                hi = k;
+            }
+        if (lo >= 0) {
+            IDirect3DDevice9_SetVertexShaderConstantF(g.dev, (UINT)lo, (const float *)gv->block + 4 * lo, (UINT)(hi - lo + 1));
+            memcpy(lastc + 4 * lo, (const float *)gv->block + 4 * lo, (size_t)(hi - lo + 1) * 16u);
+        }
     }
     IDirect3DDevice9_SetVertexShaderConstantF(g.dev, 192, &cst[0][0], 3);
-    IDirect3DDevice9_SetVertexDeclaration(g.dev, sp->decl);
-    IDirect3DDevice9_SetVertexShader(g.dev, sp->vs);
-    IDirect3DDevice9_SetStreamSource(g.dev, 1, NULL, 0, 0);
+    if (!s_gvs_bound || s_gvs_decl != dcl) { IDirect3DDevice9_SetVertexDeclaration(g.dev, dcl); s_gvs_decl = dcl; }
+    if (!s_gvs_bound || s_gvs_vs != sp->vs) { IDirect3DDevice9_SetVertexShader(g.dev, sp->vs); s_gvs_vs = sp->vs; }
+    if (!s_gvs_bound) {
+        IDirect3DDevice9_SetStreamSource(g.dev, 1, NULL, 0, 0);
+        IDirect3DDevice9_SetIndices(g.dev, s_gib);
+        s_gvs_bound = 1;
+    }
     IDirect3DDevice9_SetStreamSource(g.dev, 0, s_gvb, at_off, stride);
-    IDirect3DDevice9_SetIndices(g.dev, s_gib);
+    { uint64_t n_ = qpc_us(); pf.g_set += n_ - tf0; tf0 = n_; }
     IDirect3DDevice9_DrawIndexedPrimitive(g.dev, D3DPT_TRIANGLELIST, 0, 0, range, s_gib_off, nidx / 3u);
+    pf.g_draw += qpc_us() - tf0;
     s_gib_off += nidx;
     s_gdraws++; s_gverts += nidx;
     return 1;

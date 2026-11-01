@@ -115,3 +115,43 @@ d3d11, d3dcompiler_47 and mfreadwrite are delay-loaded (toolkit code this projec
 missing (XP has none); d3dcompiler_43 is preferred on XP and load errors are silent. Dev builds started without a console log to
 native\hitz_log.txt. Test package: C:\Recomp\local-build\xp-test (README inside). Not yet run on a real XP machine.
 If EPL-2.0 code is distributed in a release, mention VC-LTL in the credits/notices.
+
+## XP on real hardware and performance work, 2026-10-31 (status and plan; Windows XP release is ON HOLD)
+Test PC "dv7": Intel Core 2 Duo T6400 (2 cores, 2.0 GHz), ATI Mobility Radeon HD 4650 (SM3.0, hardware vertex processing), XP, vsync off.
+The XP build runs: D3D9 SM3.0 device, shader compiler d3dcompiler_43 (longest vertex program 217 slots, all compile), intro to menus to a match.
+Not working/unknown there: intro movies (no Media Foundation), speed (below), audio underruns when the CPU cannot keep up.
+
+**Timing instrumentation (backend_d3d9.c, always on, no env needed):** a `[PERF]` block every 5 s in hitz_log.txt: real presented fps, worst frame,
+graphics-thread busy/idle split (draw, texture, upload, clear, present, shader pump), executor waits (ring space / frame finish), per-frame draws,
+triangles, texture checks, a draw-cost split, a texture detail line (sample check, full hash, decode, upload, bind), and which vertex formats were copied natively.
+A `[PERF] adapter:` line logs GPU, driver, hardware/software vertex processing and vsync at start.
+
+**Findings (dv7 logs in analysis/xplog_dv7*, local only):** the game runs only 5-19 fps there; the graphics thread (one thread replaying the game's draw calls)
+and the game thread do not overlap (the game waits for each frame to finish), and our own CPU work per draw, not the driver or GPU, was most of the cost
+(vertex conversion ~28%, vertex upload ~16%, texture checks ~13%, constants/state ~8%, the draw call itself ~9% of wall time on the fast PC).
+dv7 median match fps: 11.8 (build 1) -> 19.0 (build 2: idle graphics thread sleeps early on <=2 CPUs, wake threshold 8 KB, GPU-program constant cache).
+
+**Done in this branch (uncommitted before this commit; tested on the fast PC only, match picture checked, not pixel-compared):**
+- idle spin 300 (was 20000) and 8 KB wake threshold when the PC has <=2 logical CPUs (RECOMP_GFX_SPIN overrides the spin count)
+- getenv() no longer called per draw/clear; pixel shader + its 24 constants cached (set_ps_k); GPU-program vertex constants uploaded only for the changed registers;
+  declaration/shader/stream 1/index buffer set once while consecutive draws are GPU-program draws (s_gvs_bound)
+- texture re-checks: full re-hash of a texture at most every 1.5 s (was 0.5 s) and at most 6 per frame, sampled check 256 words (was 512); a changed sample still reloads at once
+- #1 native vertex formats: the CPU copies the game's own bytes (float1-4, D3DCOLOR, UBYTE4N, SHORT2/4/N) and the GPU converts; the declaration is cached per attribute layout
+  (gvs_classify, gvs_decl_for); attributes whose missing components are not the D3D default 0,0,0,1, and 11-11-10 data, still convert to float4 on the CPU.
+  Fast PC, same test match: vertex conversion 28% -> 8% of wall time, graphics thread 93% -> ~75% busy, ~47-51 -> ~49-63 fps.
+- #2 texture lookup memo in front of the 768-entry scan (little gain by itself: the cost is the change check and sampler setup, not the search)
+
+**Uncapped measurement (fast PC):** menus ~700 fps; heavy match scene (1800-2500 draws, 220-280k triangles/frame) 41-56 fps with frame_rate=360 and flip pacing off.
+The graphics thread is only 66-75% busy: the game thread and the graphics thread run one after the other. Frame pacing "edge" (default in the real game) holds the normal build near 60.
+analysis\dx9test.ps1 has an -Uncapped switch (frame_rate=360); RECOMP_FLIP_PACING=0 turns pacing off for a measurement.
+
+**Plan (David's order):**
+1. (done) native vertex formats, texture lookup memo
+2. Split the CPU work over 2 cores: a worker thread prepares vertices/uploads for the draws of a frame while the graphics thread owns the D3D9 device (all device calls stay on one thread).
+   Expected smaller gain on the 2-core dv7 because the game thread needs a core too.
+3. Cut vertex upload (~18%, now the biggest piece: decode straight into the locked buffer, fewer bytes) and the rest of the texture/sampler cost (~13%).
+4. Let the game thread run ahead of rendering (needs textures snapshotted or protected: today textures are read from guest memory at draw time and a flip waits for the ring to drain). Up to ~1.25-1.4x; risky, do last.
+5. Merge consecutive draws with identical state (fewer draw calls); look at which attributes still fall back to float4.
+6. Then a dv7 timing build (installer pattern: 7-Zip SFX that replaces native\exe in C:\NHLHitzProXP; see the timing update builds in C:\Recomp\local-build).
+7. Later: the same ideas for the D3D11 back end (texture re-check limits, idle spin on <=2 CPUs, state caching; native vertex formats and #1 do not apply, D3D11 decodes in the shader). Profile it first. A D3D11 change is a release change: new version, tested on other PCs first.
+Windows XP release stays on hold; nothing here goes into a release without David's say.

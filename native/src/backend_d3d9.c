@@ -60,6 +60,11 @@ static IDirect3DVertexBuffer9 *s_gvb;         /* GPU vertex programs: the decode
 static uint32_t s_gvb_off;
 static IDirect3DIndexBuffer9 *s_gib;          /* indices of GPU vertex-program draws */
 static uint32_t s_gib_off;                    /* in indices */
+static int s_gvs_bound;                       /* decl, vertex shader, stream 1 and indices still hold the last GPU-program draw's */
+static IDirect3DVertexDeclaration9 *s_gvs_decl;
+static IDirect3DVertexShader9 *s_gvs_vs;
+static IDirect3DPixelShader9 *s_ps_cur;       /* last pixel shader / combiner constants set (NULL / !valid: unknown) */
+static int s_k_valid;
 static int s_vc_valid;                        /* the vertex constant registers hold the last fast-path block; any other writer clears it */
 
 static void logf_(const char *fmt, ...)
@@ -916,19 +921,31 @@ static void aspect_poschanging(HWND h, WINDOWPOS *p)
 
 static uint64_t qpc_us(void)
 {
-    LARGE_INTEGER f, c;
-    QueryPerformanceFrequency(&f);
+    static LONGLONG freq;
+    LARGE_INTEGER c;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
     QueryPerformanceCounter(&c);
-    return (uint64_t)(c.QuadPart * 1000000ull / f.QuadPart);
+    return (uint64_t)(c.QuadPart * 1000000ull / freq);
 }
 
-/* ~512 words spread over the span plus the first/last: far cheaper than a full hash. */
+/* Timing build: where the time of a presented frame goes, logged every 5 s as [PERF] (always on, no env needed). The graphics
+ * thread owns most counters; the executor thread (the game side) adds its waits through the Interlocked ones. Microseconds. */
+static struct {
+    uint64_t draw, tex, texup, clear, flip, present, gvs, idle, blit, frame_max, last_flip, t_start;
+    uint64_t draws, texcalls, texups, texup_px, flips, tris, qd_sum, qd_max;
+    uint64_t d_prep, d_state, d_ps, d_tex, d_pre_gvs, g_decode, g_lock, g_set, g_draw, spins_slept, t_sample, t_full, t_decode, t_bind;
+} pf;
+static volatile LONG pf_pwait, pf_fwait;      /* executor: waiting for ring space / for the graphics thread to finish a frame */
+static volatile LONG pf_pwait_n, pf_fwait_n;
+static uint64_t pf_idle_from;                 /* graphics thread: when it began to wait for data (0 = busy) */
+
+/* ~256 words spread over the span plus the first/last: far cheaper than a full hash. */
 static uint64_t sample_span(const uint8_t *p, size_t n)
 {
     uint64_t h = 1469598103934665603ull;
     size_t words = n / 8, step, i;
     if (words == 0) return 0;
-    step = words / 512 ? words / 512 : 1;
+    step = words / 256 ? words / 256 : 1;
     for (i = 0; i < words; i += step) {
         uint64_t v;
         memcpy(&v, p + i * 8, 8);
@@ -1376,6 +1393,17 @@ static void ss(int stage, D3DSAMPLERSTATETYPE t, DWORD v)
     IDirect3DDevice9_SetSamplerState(g.dev, (DWORD)stage, t, v);
 }
 
+static float s_k_cur[RC_NK][4];
+static void set_ps_k(IDirect3DPixelShader9 *ps, const float *K)
+{
+    if (s_ps_cur != ps) { IDirect3DDevice9_SetPixelShader(g.dev, ps); s_ps_cur = ps; }
+    if (!s_k_valid || memcmp(s_k_cur, K, sizeof s_k_cur)) {
+        IDirect3DDevice9_SetPixelShaderConstantF(g.dev, 0, K, RC_NK);
+        memcpy(s_k_cur, K, sizeof s_k_cur);
+        s_k_valid = 1;
+    }
+}
+
 static void settex(int stage, IDirect3DTexture9 *t)
 {
     if (s_bound[stage] == (IDirect3DBaseTexture9 *)t) return;
@@ -1386,7 +1414,7 @@ static void settex(int stage, IDirect3DTexture9 *t)
 static void state_forget(void)
 {
     memset(s_rsk, 0, sizeof s_rsk);
-    s_vc_valid = 0;
+    s_vc_valid = 0; s_gvs_bound = 0; s_ps_cur = NULL; s_k_valid = 0;
     memset(s_ssk, 0, sizeof s_ssk);
     memset(s_bound, 0, sizeof s_bound);
     g.cur_rt = NULL; g.cur_ds = NULL;
@@ -1555,14 +1583,16 @@ static int tex_upload(IDirect3DTexture9 *t, const uint32_t *px, uint32_t w, uint
 {
     D3DLOCKED_RECT lr;
     uint32_t y;
+    uint64_t t0 = qpc_us();
     if (FAILED(IDirect3DTexture9_LockRect(t, 0, &lr, NULL, 0))) return 0;
     for (y = 0; y < h; y++)
         memcpy((uint8_t *)lr.pBits + (size_t)y * (size_t)lr.Pitch, px + (size_t)y * w, (size_t)w * 4);
     IDirect3DTexture9_UnlockRect(t, 0);
+    pf.texup += qpc_us() - t0; pf.texups++; pf.texup_px += (uint64_t)w * h;
     return 1;
 }
 
-static TexEntry *get_texture(const Nv2aTexture *t)
+static TexEntry *get_texture_impl(const Nv2aTexture *t)
 {
     TexEntry *e = NULL;
     int i;
@@ -1570,9 +1600,18 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     size_t span, need;
 
     if (!t->width || !t->height || t->width > 4096 || t->height > 4096) return NULL;
-    for (i = 0; i < s_ntex; i++)
-        if (s_tex[i].off == t->offset && s_tex[i].color == t->color && s_tex[i].w == t->width
-            && s_tex[i].h == t->height && s_tex[i].pitch == t->pitch) { e = &s_tex[i]; break; }
+    {   /* direct-mapped memo in front of the scan; every hit is re-checked against the entry's own fields */
+        static short memo[2048];
+        unsigned k = (((t->offset >> 4) * 2654435761u) ^ (t->width * 40503u) ^ (t->height * 9973u) ^ t->color) >> 7 & 2047u;
+        int m = memo[k] - 1;
+        if (m >= 0 && m < s_ntex && s_tex[m].off == t->offset && s_tex[m].color == t->color && s_tex[m].w == t->width
+            && s_tex[m].h == t->height && s_tex[m].pitch == t->pitch) e = &s_tex[m];
+        else {
+            for (i = 0; i < s_ntex; i++)
+                if (s_tex[i].off == t->offset && s_tex[i].color == t->color && s_tex[i].w == t->width
+                    && s_tex[i].h == t->height && s_tex[i].pitch == t->pitch) { e = &s_tex[i]; memo[k] = (short)(i + 1); break; }
+        }
+    }
     /* Hash once per presented frame: titles rewrite textures between frames, rarely between two draws of one. */
     if (e && e->hash_flip == g.flips && e->tex) { e->last_use = g.flips; return e; }
     t0 = qpc_us();
@@ -1580,13 +1619,18 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     if (e && span) {
         /* Full hashes of 300+ textures every presented frame cost more than the rendering. Check a sample
          * every frame; take the full hash only when the sample moved or the last full hash is older than 500 ms. */
-        uint64_t sh = sample_span(((uint8_t *)XBOX_HOST(t->offset)), span);
-        if (sh == e->sample && t0 - e->full_us < 500000) {
+        uint64_t ts_ = qpc_us(), sh = sample_span(((uint8_t *)XBOX_HOST(t->offset)), span);
+        pf.t_sample += qpc_us() - ts_;
+        static uint32_t cap_flip, cap_n;
+        if (cap_flip != g.flips) { cap_flip = g.flips; cap_n = 0; }
+        /* periodic full re-hash: at most 6 per presented frame, each texture at most every 1.5 s (a changed sample still re-hashes at once) */
+        if (sh == e->sample && (t0 - e->full_us < 1500000 || cap_n >= 6)) {
             e->hash_flip = g.flips; e->last_use = g.flips;
             return e;
         }
+        if (sh == e->sample) cap_n++;
     }
-    if (span) h = hash_span(((uint8_t *)XBOX_HOST(t->offset)), span);
+    if (span) { uint64_t tf_ = qpc_us(); h = hash_span(((uint8_t *)XBOX_HOST(t->offset)), span); pf.t_full += qpc_us() - tf_; }
     if (e && e->hash == h) {
         e->sample = span ? sample_span(((uint8_t *)XBOX_HOST(t->offset)), span) : 0;
         e->full_us = t0; e->hash_flip = g.flips; e->last_use = g.flips;
@@ -1600,11 +1644,17 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         s_scratch_cap = s_scratch ? need : 0;
         if (!s_scratch) return NULL;
     }
-    if (!nv2a_backend_decode_texture(t, s_scratch)) {
+    {   uint64_t td_ = qpc_us();
+        int ok_ = nv2a_backend_decode_texture(t, s_scratch);
+        pf.t_decode += qpc_us() - td_;
+        if (ok_) goto decoded_;
+    }
+    {
         if (g.log) logf_("texture decode failed: off 0x%08X fmt 0x%X %ux%u pitch %u\n",
                          t->offset, t->color, t->width, t->height, t->pitch);
         return NULL;
     }
+decoded_:
     if (!e) {
         if (s_ntex < MAX_TEX) e = &s_tex[s_ntex++];
         else {                                           /* evict the least recently used */
@@ -1628,6 +1678,14 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     e->full_us = t0;
     e->hash_flip = g.flips;
     e->last_use = g.flips;
+    return e;
+}
+
+static TexEntry *get_texture(const Nv2aTexture *t)
+{
+    uint64_t t0 = qpc_us();
+    TexEntry *e = get_texture_impl(t);
+    pf.tex += qpc_us() - t0; pf.texcalls++;
     return e;
 }
 
@@ -1851,6 +1909,15 @@ static int create_device(void)
         hr = IDirect3D9_CreateDevice(g.d9, D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, g.hwnd, fl, &g.pp, &g.dev);
     }
     if (FAILED(hr)) { logf_("CreateDevice failed 0x%08lX\n", (unsigned long)hr); return 0; }
+    {   D3DADAPTER_IDENTIFIER9 ai;
+        if (SUCCEEDED(IDirect3D9_GetAdapterIdentifier(g.d9, D3DADAPTER_DEFAULT, 0, &ai)))
+            fprintf(stderr, "[PERF] adapter: %s | driver %s %u.%u.%u.%u | vendor %04lX device %04lX | vertex processing: %s | vsync %s | VS %lu.%lu PS %lu.%lu\n",
+                    ai.Description, ai.Driver, HIWORD(ai.DriverVersion.HighPart), LOWORD(ai.DriverVersion.HighPart),
+                    HIWORD(ai.DriverVersion.LowPart), LOWORD(ai.DriverVersion.LowPart), (unsigned long)ai.VendorId, (unsigned long)ai.DeviceId,
+                    (fl & D3DCREATE_HARDWARE_VERTEXPROCESSING) ? "hardware" : "SOFTWARE", g.vsync ? "on" : "off",
+                    (unsigned long)D3DSHADER_VERSION_MAJOR(g.caps.VertexShaderVersion), (unsigned long)D3DSHADER_VERSION_MINOR(g.caps.VertexShaderVersion),
+                    (unsigned long)D3DSHADER_VERSION_MAJOR(g.caps.PixelShaderVersion), (unsigned long)D3DSHADER_VERSION_MINOR(g.caps.PixelShaderVersion));
+    }
     logf_("device up, back buffer %ux%u, pixel shader %lu.%lu\n", g.pp.BackBufferWidth, g.pp.BackBufferHeight,
           (unsigned long)D3DSHADER_VERSION_MAJOR(g.caps.PixelShaderVersion), (unsigned long)D3DSHADER_VERSION_MINOR(g.caps.PixelShaderVersion));
 
@@ -1977,6 +2044,8 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     float vk[4], zscale;
     int atest, usez, gpu;
     uint32_t afunc;
+    uint64_t tl = qpc_us();
+#define PFLAP(f) do { uint64_t n_ = qpc_us(); pf.f += n_ - tl; tl = n_; } while (0)
 
     if (!b || !b->count || !b->state || !init_window_and_device() || g.lost) return;
     x = nv2a_pbx_current();
@@ -2015,11 +2084,19 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
                   b->vertices[0].x, b->vertices[0].y, b->vertices[0].z, b->vertices[0].rhw, (unsigned)b->vertices[0].diffuse);
         }
     }
-    if (getenv("RECOMP_D3D9_NOZ")) usez = 0;
-    bind_rt(r, usez);
-    if (!getenv("RECOMP_D3D9_NOSTATE")) apply_state(rs_, usez);
-    IDirect3DDevice9_SetVertexShaderConstantF(g.dev, 0, vk, 1);
-    s_vc_valid = 0;                              /* c0 is now this draw's; the GPU vertex-program cache must reload */
+    {   static int noz = -1, nostate = -1;
+        if (noz < 0) { noz = getenv("RECOMP_D3D9_NOZ") != NULL; nostate = getenv("RECOMP_D3D9_NOSTATE") != NULL; }
+        if (noz) usez = 0;
+        PFLAP(d_prep);
+        bind_rt(r, usez);
+        if (!nostate) apply_state(rs_, usez);
+    }
+    if (!gpu) {                                  /* only the CPU-vertex shaders read c0; a GPU program brings its own constants */
+        IDirect3DDevice9_SetVertexShaderConstantF(g.dev, 0, vk, 1);
+        s_vc_valid = 0;                          /* c0 is now this draw's; the GPU vertex-program cache must reload */
+        s_gvs_bound = 0;                         /* and this path sets its own declaration, shader and streams */
+    }
+    PFLAP(d_state);
 
     {   static int simple = -1;            /* RECOMP_D3D9_SIMPLE=1: diagnostic, stage-0 path only */
         if (simple < 0) simple = getenv("RECOMP_D3D9_SIMPLE") != NULL;
@@ -2028,6 +2105,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
     if (x && (x->ext || gpu) && x->rc) {                 /* register combiners */
         const Nv2aCombiner *rc = x->rc;
         IDirect3DPixelShader9 *ps = rc_get_ps(rc, atest, afunc);
+        PFLAP(d_ps);
         if (ps) {
             IDirect3DTexture9 *tx[4];
             float K[RC_NK][4];
@@ -2055,20 +2133,23 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
             K[23][0] = (float)(rs_->alpha_ref & 0xFF);
             xoff = gpu ? 0 : vb_put(g.xvb, &g.xvb_off, XVB_BYTES, x->ext, xb);
             if (xoff >= 0) {
-                for (st = 0; st < 4; st++) {
-                    settex((int)st, tx[st]);
-                    if (K[st][2] != 0.0f) apply_sampler((int)st, &x->tex[st]); else apply_sampler_point((int)st);
+                {   uint64_t tb_ = qpc_us();
+                    for (st = 0; st < 4; st++) {
+                        settex((int)st, tx[st]);
+                        if (K[st][2] != 0.0f) apply_sampler((int)st, &x->tex[st]); else apply_sampler_point((int)st);
+                    }
+                    pf.t_bind += qpc_us() - tb_;
                 }
+                PFLAP(d_tex);
                 if (gpu) {                                   /* the vertex program runs on the GPU */
-                    IDirect3DDevice9_SetPixelShader(g.dev, ps);
-                    IDirect3DDevice9_SetPixelShaderConstantF(g.dev, 0, &K[0][0], RC_NK);
+                    set_ps_k(ps, &K[0][0]);
+                    PFLAP(d_pre_gvs);
                     if (gvs_draw(x->gpu, rs_, r, zscale)) { g.draws++; g.tris += x->gpu->nidx / 3; }
                     return;
                 }
                 IDirect3DDevice9_SetVertexDeclaration(g.dev, g.decl_rc);
                 IDirect3DDevice9_SetVertexShader(g.dev, g.vs_rc);
-                IDirect3DDevice9_SetPixelShader(g.dev, ps);
-                IDirect3DDevice9_SetPixelShaderConstantF(g.dev, 0, &K[0][0], RC_NK);
+                set_ps_k(ps, &K[0][0]);
                 IDirect3DDevice9_SetStreamSource(g.dev, 0, g.vb, (UINT)voff, (UINT)sizeof(Nv2aVertex));
                 IDirect3DDevice9_SetStreamSource(g.dev, 1, g.xvb, (UINT)xoff, (UINT)sizeof(Nv2aVertexExt));
                 {   HRESULT dh = IDirect3DDevice9_DrawPrimitive(g.dev, D3DPT_TRIANGLELIST, 0, count / 3);
@@ -2095,6 +2176,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         K[2] = (float)(rs_->alpha_ref & 0xFF);
         if (getenv("RECOMP_D3D9_FF")) {          /* diagnostic: fixed function, pre-transformed vertices */
             HRESULT dh;
+            s_ps_cur = NULL; s_k_valid = 0;
             IDirect3DDevice9_SetVertexShader(g.dev, NULL);
             IDirect3DDevice9_SetPixelShader(g.dev, NULL);
             IDirect3DDevice9_SetVertexDeclaration(g.dev, NULL);
@@ -2123,6 +2205,7 @@ static void be_draw_impl(const Nv2aSurface *s, const Nv2aBatch *b)
         }
         IDirect3DDevice9_SetVertexDeclaration(g.dev, g.decl_s);
         IDirect3DDevice9_SetVertexShader(g.dev, g.vs_s);
+        s_ps_cur = NULL; s_k_valid = 0;
         IDirect3DDevice9_SetPixelShader(g.dev, get_ps_simple(t != NULL, atest, afunc));
         IDirect3DDevice9_SetPixelShaderConstantF(g.dev, 0, K, 1);
         IDirect3DDevice9_SetStreamSource(g.dev, 0, g.vb, (UINT)voff, (UINT)sizeof(Nv2aVertex));
@@ -2141,10 +2224,19 @@ static void be_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     uint64_t t0 = qpc_us();
     be_draw_impl(s, b);
     s_us_draw += qpc_us() - t0;
+    pf.draw += qpc_us() - t0; pf.draws++;
     s_us_draws_n++;
 }
 
+static void be_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs_, uint32_t flags, uint32_t argb, uint32_t zstencil);
 static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs_, uint32_t flags, uint32_t argb, uint32_t zstencil)
+{
+    uint64_t t0 = qpc_us();
+    be_clear_impl(s, rs_, flags, argb, zstencil);
+    pf.clear += qpc_us() - t0;
+}
+
+static void be_clear_impl(const Nv2aSurface *s, const Nv2aRenderState *rs_, uint32_t flags, uint32_t argb, uint32_t zstencil)
 {
     RenderTarget *r;
     DWORD f = 0;
@@ -2162,7 +2254,10 @@ static void be_clear(const Nv2aSurface *s, const Nv2aRenderState *rs_, uint32_t 
     }
     if (!f) return;
     if (g.log) { static int nc; if (nc++ < 12) logf_("clear rt %08X flags %X argb %08X zst %08X\n", s->color_va, flags, argb, zstencil); }
-    if (getenv("RECOMP_D3D9_REDCLEAR")) argb = 0xFF400000u;
+    {   static int red = -1;
+        if (red < 0) red = getenv("RECOMP_D3D9_REDCLEAR") != NULL;
+        if (red) argb = 0xFF400000u;
+    }
     IDirect3DDevice9_Clear(g.dev, 0, NULL, f, (D3DCOLOR)argb, (zstencil >> 8) / 16777215.0f, zstencil & 0xFF);
 }
 
@@ -2261,7 +2356,10 @@ static int present_rt(RenderTarget *r)
     if (vw < cw || vh < ch) IDirect3DDevice9_ColorFill(g.dev, bb, &src, D3DCOLOR_XRGB(0, 0, 0));
     IDirect3DDevice9_StretchRect(g.dev, r->surf, NULL, bb, &dst, D3DTEXF_LINEAR);
     IDirect3DSurface9_Release(bb);
-    hr = IDirect3DDevice9_Present(g.dev, &src, NULL, NULL, NULL);
+    {   uint64_t tp = qpc_us();
+        hr = IDirect3DDevice9_Present(g.dev, &src, NULL, NULL, NULL);
+        pf.present += qpc_us() - tp;
+    }
     if (hr == D3DERR_DEVICELOST) g.lost = 1;
     s_last = r;
     return SUCCEEDED(hr);
@@ -2276,13 +2374,26 @@ static void aspect_on_size(void)
     s_asp_busy = 0;
 }
 
+static void perf_report(void);
+static void be_flip_impl(void);
 static void be_flip(void)
+{
+    uint64_t t0 = qpc_us();
+    be_flip_impl();
+    pf.flip += qpc_us() - t0; pf.flips++;
+    perf_report();
+}
+
+static void be_flip_impl(void)
 {
     RenderTarget *best = NULL;
     int i;
 
     if (!init_window_and_device()) return;
-    gvs_pump();                                  /* shader objects for programs the worker has compiled */
+    {   uint64_t tg = qpc_us();
+        gvs_pump();                              /* shader objects for programs the worker has compiled */
+        pf.gvs += qpc_us() - tg;
+    }
     if (g.lost) {
         HRESULT hr = IDirect3DDevice9_TestCooperativeLevel(g.dev);
         if (hr == D3DERR_DEVICENOTRESET) dev_reset();
@@ -2342,6 +2453,51 @@ static void be_flip(void)
         logf_("time in be_draw %llu ms of which attribute decode %llu ms (draws %llu)\n", (unsigned long long)(s_us_draw / 1000), (unsigned long long)(s_us_fetch / 1000), (unsigned long long)s_us_draws_n);
 }
 
+static void perf_report(void)
+{
+    uint64_t now = qpc_us(), wall, busy;
+    LONG pw, fw, pwn, fwn;
+    if (pf.last_flip) { uint64_t gap = now - pf.last_flip; if (gap > pf.frame_max) pf.frame_max = gap; }
+    pf.last_flip = now;
+    if (!pf.t_start) { pf.t_start = now; return; }
+    wall = now - pf.t_start;
+    if (wall < 5000000) return;
+    pw = InterlockedExchange(&pf_pwait, 0); pwn = InterlockedExchange(&pf_pwait_n, 0);
+    fw = InterlockedExchange(&pf_fwait, 0); fwn = InterlockedExchange(&pf_fwait_n, 0);
+    busy = pf.draw + pf.clear + pf.flip + pf.blit;
+    fprintf(stderr,
+        "[PERF] %.1fs: %.1f fps (%llu frames) | worst frame %.0f ms | gfx thread busy %.0f%% (draw %.0f%% [texture %.0f%%, upload %.0f%%], clear %.0f%%, "
+        "flip %.0f%% [present %.0f%%, shader pump %.0f%%], blit %.0f%%) idle %.0f%%\n",
+        (double)wall / 1e6, pf.flips * 1e6 / (double)wall, (unsigned long long)pf.flips, pf.frame_max / 1000.0,
+        busy * 100.0 / wall, pf.draw * 100.0 / wall, pf.tex * 100.0 / wall, pf.texup * 100.0 / wall, pf.clear * 100.0 / wall,
+        pf.flip * 100.0 / wall, pf.present * 100.0 / wall, pf.gvs * 100.0 / wall, pf.blit * 100.0 / wall, pf.idle * 100.0 / wall);
+    fprintf(stderr,
+        "[PERF]   per frame: %.1f draws, %.1f tris, %.2f texture checks, %.2f uploads (%.0f KB) | executor waited for ring space %.0f ms (%ld times), "
+        "for the frame to finish %.0f ms (%ld times) | ring %.0f KB avg, %.0f KB max\n",
+        pf.flips ? (double)pf.draws / pf.flips : 0.0, pf.flips ? (double)g.tris / pf.flips : 0.0,
+        pf.flips ? (double)pf.texcalls / pf.flips : 0.0, pf.flips ? (double)pf.texups / pf.flips : 0.0,
+        pf.flips ? pf.texup_px * 4.0 / 1024.0 / pf.flips : 0.0, pw / 1000.0, pwn, fw / 1000.0, fwn,
+        pf.flips ? pf.qd_sum / 1024.0 / pf.flips : 0.0, pf.qd_max / 1024.0);
+    fprintf(stderr,
+        "[PERF]   draw time split (%% of wall): get surface+depth %.0f, bind+state %.0f, pixel shader %.0f, textures+samplers %.0f, pre-vertex %.0f | "
+        "vertex-program draw: decode vertices %.0f, buffer upload %.0f, constants+state %.0f, DrawIndexedPrimitive %.0f\n",
+        pf.d_prep * 100.0 / wall, pf.d_state * 100.0 / wall, pf.d_ps * 100.0 / wall, pf.d_tex * 100.0 / wall, pf.d_pre_gvs * 100.0 / wall,
+        pf.g_decode * 100.0 / wall, pf.g_lock * 100.0 / wall, pf.g_set * 100.0 / wall, pf.g_draw * 100.0 / wall);
+    fprintf(stderr,
+        "[PERF]   texture detail (%% of wall): sample check %.1f, full hash %.1f, decode %.1f, upload %.1f, bind+samplers %.1f (all inside the texture figures above)\n",
+        pf.t_sample * 100.0 / wall, pf.t_full * 100.0 / wall, pf.t_decode * 100.0 / wall, pf.texup * 100.0 / wall, pf.t_bind * 100.0 / wall);
+    {   int ty, sz; char fm[256]; size_t n = 0;
+        fm[0] = 0;
+        for (ty = 0; ty < 8; ty++) for (sz = 0; sz < 5; sz++)
+            if (s_fmt_verts[ty][sz] && n < 200) n += (size_t)snprintf(fm + n, sizeof fm - n, " t%d/%d:%u", ty, sz, s_fmt_verts[ty][sz]);
+        fprintf(stderr, "[PERF]   vertex attributes copied natively (type/size: vertices):%s | converted to float4: %u\n", fm, s_fmt_float4_verts);
+        memset(s_fmt_verts, 0, sizeof s_fmt_verts); s_fmt_float4_verts = 0;
+    }
+    memset(&pf, 0, sizeof pf);
+    pf.t_start = now; pf.last_flip = now;
+    g.tris = 0;
+}
+
 static const Nv2aBackend s_backend = { be_clear, be_draw, be_flip };
 
 
@@ -2372,9 +2528,10 @@ static size_t q_al(size_t n) { return (n + 15u) & ~(size_t)15u; }
 /* A sleeping consumer is woken when a worthwhile amount is queued (a syscall per record cost the executor
  * a tenth of its time), and always at the end of a frame or when the ring is full; it also wakes by itself
  * after a millisecond. */
+static LONG64 q_wake_bytes = 64 << 10;
 static void q_wake_consumer(int force)
 {
-    if (q_cons_sleep && (force || q_head - q_tail >= (64 << 10))) SetEvent(q_ev_data);
+    if (q_cons_sleep && (force || q_head - q_tail >= q_wake_bytes)) SetEvent(q_ev_data);
 }
 
 /* Room for n bytes at the producer's head, without wrapping inside the record. */
@@ -2396,8 +2553,11 @@ static uint8_t *q_reserve(size_t n)
         }
         q_wake_consumer(1);
         InterlockedExchange(&q_prod_sleep, 1);
-        if ((size_t)(Q_BYTES - (q_head - q_tail)) < pad + n)
+        if ((size_t)(Q_BYTES - (q_head - q_tail)) < pad + n) {
+            uint64_t tw = qpc_us();
             WaitForSingleObject(q_ev_space, 1);
+            InterlockedExchangeAdd(&pf_pwait, (LONG)(qpc_us() - tw)); InterlockedIncrement(&pf_pwait_n);
+        }
         InterlockedExchange(&q_prod_sleep, 0);
     }
 }
@@ -2463,8 +2623,11 @@ static void ab_flip(void)
     LONG want = InterlockedIncrement(&q_flips_posted);
     h->type = Q_FLIP; h->size = 16;
     q_commit(16, 1);
-    while ((LONG)(q_flips_done - want) < 0)
-        WaitForSingleObject(q_ev_done, 1);
+    {   uint64_t tw = qpc_us();
+        while ((LONG)(q_flips_done - want) < 0)
+            WaitForSingleObject(q_ev_done, 1);
+        InterlockedExchangeAdd(&pf_fwait, (LONG)(qpc_us() - tw)); InterlockedIncrement(&pf_fwait_n);
+    }
 }
 
 static void ab_blit(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
@@ -2499,7 +2662,14 @@ static void q_replay_draw(QDraw *r)
 static DWORD WINAPI gfx_thread_main(LPVOID unused)
 {
     int spin = 0;
+    int spin_max = 20000;
     (void)unused;
+    {   SYSTEM_INFO si;                     /* on a 2-core PC an idle spin steals the game thread's core: sleep early */
+        GetSystemInfo(&si);
+        if (si.dwNumberOfProcessors <= 2) { spin_max = 300; q_wake_bytes = 8 << 10; }
+        if (getenv("RECOMP_GFX_SPIN")) spin_max = atoi(getenv("RECOMP_GFX_SPIN"));
+        fprintf(stderr, "[PERF] %lu logical CPUs, graphics thread spins %d times before sleeping\n", (unsigned long)si.dwNumberOfProcessors, spin_max);
+    }
     init_window_and_device();
     MemoryBarrier();
     InterlockedExchange(&s_dev_ready, 1);
@@ -2507,20 +2677,23 @@ static DWORD WINAPI gfx_thread_main(LPVOID unused)
         LONG64 tail = q_tail, head = q_head;
         QHdr *h;
         if (tail == head) {
-            if (++spin < 20000) { YieldProcessor(); continue; }
+            if (!pf_idle_from) pf_idle_from = qpc_us();
+            if (++spin < spin_max) { YieldProcessor(); continue; }
             InterlockedExchange(&q_cons_sleep, 1);
             if (q_head == q_tail) WaitForSingleObject(q_ev_data, 1);
             InterlockedExchange(&q_cons_sleep, 0);
             spin = 0;
             continue;
         }
+        if (pf_idle_from) { pf.idle += qpc_us() - pf_idle_from; pf_idle_from = 0; }
         spin = 0;
         h = (QHdr *)(q_buf + (size_t)(tail % Q_BYTES));
         switch (h->type) {
         case Q_CLEAR: { QClear *c = (QClear *)h; be_clear(&c->s, &c->rs, c->flags, c->argb, c->zst); } break;
         case Q_DRAW:  q_replay_draw((QDraw *)h); break;
-        case Q_BLIT:  { QBlit *c = (QBlit *)h; be_blit(c->a, c->b, c->c, c->d); } break;
+        case Q_BLIT:  { QBlit *c = (QBlit *)h; uint64_t tb = qpc_us(); be_blit(c->a, c->b, c->c, c->d); pf.blit += qpc_us() - tb; } break;
         case Q_FLIP:
+            { uint64_t qd = (uint64_t)(q_head - q_tail); pf.qd_sum += qd; if (qd > pf.qd_max) pf.qd_max = qd; }
             be_flip();
             InterlockedIncrement(&q_flips_done);
             SetEvent(q_ev_done);
