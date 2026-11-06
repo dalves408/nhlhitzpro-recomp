@@ -1,0 +1,53 @@
+add_compile_definitions(_GNU_SOURCE)
+add_compile_options(-fno-strict-aliasing -fwrapv -ffp-contract=off)
+set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tools/xboxrecomp" CACHE PATH "Toolkit source")
+find_package(SDL2 REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
+find_package(PNG REQUIRED)
+add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
+
+function(hitz_linux_overrides target)
+    get_target_property(sources ${target} SOURCES)
+    foreach(name IN LISTS ARGN)
+        list(REMOVE_ITEM sources ${name})
+    endforeach()
+    set_property(TARGET ${target} PROPERTY SOURCES "${sources}")
+    foreach(name IN LISTS ARGN)
+        target_sources(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/linux/${name}")
+    endforeach()
+endfunction()
+hitz_linux_overrides(platform win32_compat.c)
+target_include_directories(platform PRIVATE "${XBOXRECOMP_DIR}/src/platform")
+hitz_linux_overrides(xbox_kernel nv2a_pb_exec.c nv2a_pb_scan.c nv2a_vsh_interp.c nv2a_combiner.c
+    kernel_bridge.c kernel_hal.c xbox_memory_layout.c kernel_path.c kernel_file.c)
+hitz_linux_overrides(host_time host_time.c)
+hitz_linux_overrides(xbox_apu apu_vp.c apu_dsp.c apu_sdl2.c)
+hitz_linux_overrides(xbox_usb usb_gamepad.c ohci.c)
+hitz_linux_overrides(xbox_input keyboard.c xinput_device.c)
+target_include_directories(xbox_apu PRIVATE "${XBOXRECOMP_DIR}/src/apu")
+target_include_directories(xbox_input PRIVATE "${XBOXRECOMP_DIR}/src/input")
+target_include_directories(host_time PRIVATE "${XBOXRECOMP_DIR}/src/platform")
+target_include_directories(xbox_usb PRIVATE "${XBOXRECOMP_DIR}/src/usb")
+target_include_directories(xbox_kernel PRIVATE "${XBOXRECOMP_DIR}/src")
+target_sources(xbox_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/linux_gpu_wait.c")
+
+file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
+set(HITZ_GUEST_OPT_LEVEL 2 CACHE STRING "Generated guest optimization level")
+set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES COMPILE_OPTIONS "-O${HITZ_GUEST_OPT_LEVEL};-g1")
+add_executable(${PROJECT_NAME} src/main_linux.c src/backend_gl.c src/mmio_linux.c src/filesystem_linux.c
+    src/recomp_manual.c src/pack_image.c src/gl_texture_pack.c src/linux_performance.c ${RECOMP_GEN_SOURCES})
+target_include_directories(${PROJECT_NAME} PRIVATE src src/recomp src/recomp/gen
+    "${XBOXRECOMP_DIR}/include" "${XBOXRECOMP_DIR}/src/kernel")
+target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp SDL2::SDL2 PkgConfig::EPOXY PNG::PNG)
+target_compile_definitions(${PROJECT_NAME} PRIVATE HITZ_GUEST_OPT_LEVEL=${HITZ_GUEST_OPT_LEVEL}
+    HITZ_SHADER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src/shaders")
+target_link_options(${PROJECT_NAME} PRIVATE -rdynamic)
+find_program(HITZ_LLD ld.lld)
+if(HITZ_LLD AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    target_link_options(${PROJECT_NAME} PRIVATE -fuse-ld=lld)
+endif()
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders" "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders"
+    VERBATIM)

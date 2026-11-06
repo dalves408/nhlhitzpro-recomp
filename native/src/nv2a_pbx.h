@@ -46,6 +46,7 @@ typedef struct {
 typedef struct {
     uint32_t prog[NV2A_VSH_SLOTS_MAX][4];   /* microcode, start slot .. FINAL */
     uint32_t nslots, hash, input_mask;
+    uint32_t fixed_function;                /* project FFP shader, constants packed by executor */
     const uint8_t *block;                   /* valid inside draw() only */
     uint32_t block_bytes;
     uint32_t nidx;                          /* indices = vertices drawn */
@@ -53,7 +54,8 @@ typedef struct {
     uint32_t fog_mode;                      /* 0: fog off, else the NV097 fog mode word */
     float    fog_px, fog_py;
     uint32_t verify;                        /* RECOMP_GPUVS_VERIFY: read the outputs back */
-    float   *verify_out;                    /* nidx x 28 floats, or NULL */
+    float   *verify_out;                    /* min(nidx, 4096) x 29 floats, or NULL */
+    uint32_t *verify_count;                 /* points actually read back; 0 if draw/readback was skipped */
 } Nv2aGpuVs;
 
 /* 1 if the back end can draw program e on the GPU right now (compiles its shader). */
@@ -61,7 +63,9 @@ int nv2a_gpuvs_probe(const Nv2aGpuVs *e);
 
 /* nv2a_vsh_interp.c (project): the active program, and its HLSL body. */
 int nv2a_vsh_export(Nv2aGpuVs *e);
+void nv2a_vsh_export_stats(uint64_t *hits,uint64_t *misses);
 int nv2a_vsh_gen_hlsl(const Nv2aGpuVs *e, char *out, size_t cap);
+int nv2a_vsh_gen_glsl(const Nv2aGpuVs *e, char *out, size_t cap);
 typedef struct {
     const Nv2aVertexExt *ext;
     const Nv2aCombiner  *rc;
@@ -75,5 +79,16 @@ typedef struct {
 } Nv2aBatchExt;
 
 const Nv2aBatchExt *nv2a_pbx_current(void);
+/* Valid while a synchronous backend callback executes; async backends must
+ * record it beside the surface, just like the draw's combiner state. */
+uint32_t nv2a_pbx_surface_color_format(void);
+/* Periodic progress only; diagnostic traces and errors remain independent. */
+void nv2a_pbx_progress_logs(int enabled);
+void nv2a_pbx_report_mode(int enabled);
+void nv2a_gpu_flush_pending(void);
+void nv2a_pbx_bulk_mode(int enabled);
+void nv2a_pbx_bulk_stats(uint64_t *words, uint64_t *packets);
+void nv2a_pbx_gvs_work_stats(uint64_t out[3]);
+void nv2a_pbx_ack_yield_mode(int every);
 
 #endif

@@ -20,6 +20,12 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#ifdef __linux__
+#include "kernel.h"
+#define RECOMP_TLS __thread
+#else
+#define RECOMP_TLS __declspec(thread)
+#endif
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>   /* getenv */
 
@@ -47,7 +53,7 @@ typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern __declspec(thread) uint32_t g_eax;
+extern RECOMP_TLS uint32_t g_eax;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── Manual function overrides ─────────────────────────────── */
@@ -107,7 +113,7 @@ extern ptrdiff_t g_xbox_mem_offset;
 extern void sub_001C9790(void);
 static int nhl_trace_loader = -1;
 #define NHL_G32(a) (*(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + (a)))
-extern __declspec(thread) uint32_t g_esp;
+extern RECOMP_TLS uint32_t g_esp;
 #define NHL_DEFER_SLOTS 256
 static uint32_t nhl_defer_seen[NHL_DEFER_SLOTS];
 static int nhl_defer_state = -1; /* -1 unread, 0 off, 1 on */
@@ -169,7 +175,7 @@ static void nhl_tr_15C3D0(void) { fprintf(stderr, "[LDR] sub_0015C3D0 (load comp
  * RECOMP_COALESCE_LOAD=0 disables it.
  */
 extern void sub_0002A4C0(void);
-extern __declspec(thread) uint32_t g_ecx, g_edx;
+extern RECOMP_TLS uint32_t g_ecx, g_edx;
 static int nhl_coalesce_state = -1;
 static int nhl_coalesce_depth;
 static int nhl_coalesce_pending;
@@ -404,10 +410,16 @@ void recomp_unimpl(const char *text, uint32_t va)
  * Preserve memory ordering without executing the privileged host opcode.
  * This does not drain or acknowledge NV2A GPU commands.
  */
+#ifdef _WIN32
 #include <windows.h>
+#endif
 void nhl_guest_wbinvd(void)
 {
+#ifdef _WIN32
     MemoryBarrier();
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
 
 }
 
@@ -434,7 +446,10 @@ void nhl_wait_gpu_fence(uint32_t word, uint32_t target)
  * the code-range words on the guest stack (the guest callers), then single-steps the write and
  * re-protects. Writes by another thread during that one instruction are missed. Used to find who
  * stores [asset manager + 0xBC] (boot hang investigation). Not a fix. */
+#ifdef _WIN32
 #include <windows.h>
+#endif
+#ifdef _WIN32
 static uintptr_t nhl_watch_host;          /* host address of the watched dword */
 static uintptr_t nhl_watch_page;          /* host page base */
 static uint32_t  nhl_watch_va;
@@ -489,6 +504,8 @@ void nhl_watch_start(void)
     else
         fprintf(stderr, "[WATCH] armed on guest VA 0x%08X (host page %p), value now %08X\n", nhl_watch_va, (void *)nhl_watch_page, *(volatile uint32_t *)nhl_watch_host);
 }
+#endif
+
 
 /* XPP synchronous URB wait: diagnostic (RECOMP_XPP_WAIT_LOG=1), the fix itself is in main.c.
  *
@@ -511,7 +528,9 @@ void nhl_watch_start(void)
  * On the console the wait blocks until the OHCI completes the transfer.
  * RECOMP_XPP_WAIT_FIX=1 (main.c) turns RECOMP_TITLE_KEVENTS on, which makes
  * that wait real. This hook only logs the outcome of that one wait. */
+#ifdef _WIN32
 #include <windows.h>
+#endif
 static int nhl_xpp_wait_log = -1;
 static unsigned nhl_xpp_wait_n;
 

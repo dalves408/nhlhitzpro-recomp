@@ -10,7 +10,13 @@ cmake_minimum_required(VERSION 3.20)
 #   4. Add any game-specific compile definitions or link libraries
 # ============================================================================
 
-project(nhl_hitz_pro_recomp C RC)
+project(nhl_hitz_pro_recomp C)
+
+if(UNIX AND NOT APPLE)
+    include(cmake/linux.cmake)
+    return()
+endif()
+enable_language(RC)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
