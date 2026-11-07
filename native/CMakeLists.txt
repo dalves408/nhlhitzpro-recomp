@@ -156,6 +156,13 @@ add_executable(${PROJECT_NAME} WIN32
     resources/nhl_hitz_pro.rc      # exe icon and version info
 )
 
+# Texture pack downloader used by the Inno Setup scripts (WinHTTP + SHA-256).
+if(WIN32)
+    add_executable(nhl_texture_download installer/texture_download.c)
+    target_link_libraries(nhl_texture_download PRIVATE winhttp bcrypt shell32)
+    set_property(TARGET nhl_texture_download PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
+
 # Disc import tool used by the installer (ISO / XISO / folder -> game_files).
 add_executable(nhl_import installer/nhl_import.c)
 target_link_libraries(nhl_import PRIVATE bcrypt shell32)
