@@ -71,3 +71,17 @@ sh NHLHitzPro-Setup-1.0.8-linux-x86_64.run \
 ```
 
 Runtime deps: Python/Tk, SDL2, libepoxy, libpng, optional 7-Zip / innoextract for textures.
+
+
+## Texture Revision 2 (1.0.9)
+
+Two independently extractable 7z/LZMA2 archives with a `texture_pack/` root:
+
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `texture-01.bin` | 1,046,022,933 | `b5a91ce04fc23bec07e334ed23f19b556887e6630fa8b515542d2d251fad4c1f` |
+| `texture-02.bin` | 1,717,588,748 | `6da010784eb9b44bd8d4e973fca3db35b0da494cd17416fe31ec779b583047fb` |
+
+Manifest SHA-256 `073915019f2be011a79ccd238608e3d232e157d1b89459d6b602ac010a66b0bf` (6,287 files).
+Pinned in `native/installer/texture_payload.iss` and `release.json` inside the AppImage.
+Public URLs: `.../releases/download/textures-2/...`. Place both BINs beside the AppImage for offline Setup.

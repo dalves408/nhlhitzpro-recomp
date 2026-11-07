@@ -1,4 +1,4 @@
-"""Real Linux test installer backend for the shared Tk wizard."""
+"""Real Linux installer backend for the shared Tk wizard (NHL Hitz Pro)."""
 import hashlib
 import json
 import os
@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.request
 
 from disc import validate
@@ -24,7 +23,10 @@ def ensure_settings():
     user_data.mkdir(parents=True, exist_ok=True)
     try:
         with (user_data / 'settings.ini').open('x') as output:
-            output.write('[display]\nresolution_scale=1\nfullscreen=1\nstretch=0\nvsync=0\nframe_rate=60\nmsaa=1\nanisotropy=1\n\n[textures]\nenabled=0\nrink=1\nlogos=1\njerseys=1\nglow=1\nother=1\n')
+            output.write(
+                '[display]\nresolution_scale=1\nfullscreen=1\nstretch=0\nvsync=0\n'
+                'frame_rate=60\nmsaa=1\nanisotropy=1\n\n'
+                '[textures]\nenabled=0\nrink=1\nlogos=1\njerseys=1\nglow=1\nother=1\n')
     except FileExistsError:
         pass
 
@@ -81,7 +83,8 @@ def publish(stage, dest):
                 saved = (target.with_name(f'game_files.backup-{time.time_ns()}')
                          if target == dest / 'game_files' else backup / str(index))
                 if target == dest / 'texture_pack' and any(target.iterdir()):
-                    raise ValueError('Textures appeared during setup. Run Setup again to keep them.')
+                    # Replacing an older/mismatched pack (e.g. Revision 1) is intentional.
+                    saved = target.with_name(f'texture_pack.backup-{time.time_ns()}')
                 target.rename(saved)
                 replaced.append((saved, target))
             path.rename(target)
@@ -106,9 +109,10 @@ class ProductionBackend:
         self.metadata = json.loads((ROOT / 'release.json').read_text())
         self.version = self.metadata['version']
         self.pack = self.metadata['texture']
-        self.cache = xdg_home('XDG_CACHE_HOME', '.cache') / 'nhlhitzpro/downloads' / self.pack['sha256']
-        self.downloaded = None
-        self.delete_on_exit = None
+        # Per-part caches: ~/.cache/nhlhitzpro/downloads/<part-sha256>/<filename>
+        self.cache_root = xdg_home('XDG_CACHE_HOME', '.cache') / 'nhlhitzpro/downloads'
+        self.downloaded = []
+        self.delete_on_exit = []
 
     def cancel(self):
         self.stop.set()
@@ -116,19 +120,31 @@ class ProductionBackend:
     def cancelled(self):
         return self.stop.is_set()
 
+    def texture_parts(self):
+        parts = self.pack.get('parts')
+        if parts:
+            return parts
+        return [dict(name=self.pack.get('file_name', 'texture.bin'),
+                     bytes=self.pack['bytes'], sha256=self.pack['sha256'],
+                     url=self.pack.get('url', ''))]
+
     def texture_summary(self):
         setup = Path(os.environ.get('HITZ_SETUP_DIR', ROOT))
-        name = self.pack.get('file_name', 'NHLHitzPro-HiRes-Textures-1.exe')
         if (setup / 'texture_pack' / 'manifest.txt').is_file():
             return 'A texture_pack folder beside Setup will be verified and installed; no download is needed.'
-        if (setup / name).is_file():
-            return f'{name} found beside Setup. It will be verified and extracted; no download is needed.'
-        if (self.cache / name).is_file():
-            return 'A saved texture download is available. Setup will verify and use it.'
-        if (self.cache / (name + '.part')).is_file():
-            return 'An interrupted texture download was found. Setup will resume it.'
-        gb = self.pack['bytes'] / 1e9
-        return f'{name} is not beside Setup. The {gb:.2f} GB hi-res texture pack will be downloaded.'
+        parts = self.texture_parts()
+        beside = sum(1 for part in parts if (setup / part['name']).is_file())
+        cached = sum(1 for part in parts if (self.cache_root / part['sha256'] / part['name']).is_file())
+        if beside == len(parts):
+            names = ' + '.join(part['name'] for part in parts)
+            return f'{names} found beside Setup. They will be verified and extracted; no download is needed.'
+        if beside or cached:
+            return (f'Texture pack parts: {beside} beside Setup, {cached} in cache; '
+                    f'missing parts will be downloaded.')
+        total = sum(part['bytes'] for part in parts) / 1e9
+        rev = self.pack.get('revision', '?')
+        return (f'Texture Revision {rev} ({len(parts)} parts, ~{total:.2f} GB) is not beside Setup. '
+                'Missing parts will be downloaded from GitHub (textures-2).')
 
     def validate(self, source, report):
         self.stop.clear()
@@ -139,10 +155,15 @@ class ProductionBackend:
         path = Path(destination) / 'game_files'
         return path if path.is_dir() else None
 
-    @staticmethod
-    def installed_textures(destination):
-        path = Path(destination) / 'texture_pack'
-        return path.is_dir() and any(path.iterdir())
+    def installed_textures(self, destination):
+        """True only when the installed pack matches the pinned Revision manifest."""
+        manifest = Path(destination) / 'texture_pack' / 'manifest.txt'
+        if not manifest.is_file():
+            return False
+        try:
+            return digest(manifest) == self.pack['manifest_sha256']
+        except OSError:
+            return False
 
     def check_destination(self, dest):
         if dest.exists() and (not dest.is_dir() or (any(dest.iterdir()) and not
@@ -150,52 +171,46 @@ class ProductionBackend:
                  or (dest / '.hitz-linux-install.json').is_file()))):
             raise ValueError('Choose an empty folder or an existing NHL Hitz Pro folder.')
 
-    def _verify(self, path, report):
-        if path.stat().st_size != self.pack['bytes']:
+    def _verify_part(self, path, part, report, pct_lo=38, pct_hi=43):
+        if path.stat().st_size != part['bytes']:
             return False
         last = [0.0]
+
         def update(done, total):
             now = time.monotonic()
             if now - last[0] > .15 or done == total:
                 last[0] = now
-                report(38 + done / total * 5, f'Verifying texture pack — {done / total:.1%}')
-        return digest(path, self.cancelled, update) == self.pack['sha256']
+                span = pct_hi - pct_lo
+                report(pct_lo + span * done / total,
+                       f'Verifying {part["name"]} — {done / total:.1%}')
 
-    def _payload(self, report):
-        if self.cancelled():
-            raise InterruptedError('Download stopped. Run Setup again to resume.')
-        setup = Path(os.environ.get('HITZ_SETUP_DIR', ROOT))
-        name = self.pack.get('file_name', 'NHLHitzPro-HiRes-Textures-1.exe')
-        folder = setup / 'texture_pack'
-        if (folder / 'manifest.txt').is_file():
-            report(43, 'Using texture_pack beside Setup…')
-            return folder
-        local = setup / name
-        if local.is_file():
-            if not self._verify(local, report):
-                raise ValueError(f'{name} beside Setup is not the required pack. Move it aside to download the current pack.')
-            return local
-        self.cache.mkdir(parents=True, exist_ok=True)
-        complete, partial = self.cache / name, self.cache / (name + '.part')
+        return digest(path, self.cancelled, update) == part['sha256']
+
+    def _download_part(self, part, report, pct_lo, pct_hi):
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        folder = self.cache_root / part['sha256']
+        folder.mkdir(parents=True, exist_ok=True)
+        complete, partial = folder / part['name'], folder / (part['name'] + '.part')
         if complete.exists():
-            if not self._verify(complete, report):
-                raise ValueError('Cached texture pack failed verification. Remove it and retry: ' + str(complete))
-            self.downloaded = complete
+            if not self._verify_part(complete, part, report, pct_lo, pct_lo + 2):
+                raise ValueError('Cached texture part failed verification. Remove it and retry: ' + str(complete))
+            self.downloaded.append(complete)
             return complete
-        report(43, f'{name} was not found beside Setup. Downloading the hi-res texture pack…')
+        report(pct_lo, f'Downloading {part["name"]}…')
         count = partial.stat().st_size if partial.exists() else 0
-        if count > self.pack['bytes']:
+        if count > part['bytes']:
             raise ValueError('Partial download exceeds the expected size. Remove it and retry: ' + str(partial))
-        if count < self.pack['bytes']:
+        if count < part['bytes']:
             headers = {'User-Agent': 'NHLHitzPro-Linux-Setup', 'Accept-Encoding': 'identity'}
             if count:
                 headers['Range'] = f'bytes={count}-'
-            response = urllib.request.urlopen(urllib.request.Request(self.pack['url'], headers=headers), timeout=20)
+            response = urllib.request.urlopen(urllib.request.Request(part['url'], headers=headers), timeout=20)
             with response:
                 if response.status == 200:
                     count = 0
                 elif response.status != 206 or not re.fullmatch(
-                        rf'bytes {count}-{self.pack["bytes"] - 1}/{self.pack["bytes"]}', response.headers.get('Content-Range', '')):
+                        rf'bytes {count}-{part["bytes"] - 1}/{part["bytes"]}',
+                        response.headers.get('Content-Range', '')):
                     raise ValueError('The server returned an invalid resume range. Partial data was kept.')
                 start_count, start, last = count, time.monotonic(), 0.0
                 with partial.open('ab' if count else 'wb') as output:
@@ -205,90 +220,126 @@ class ProductionBackend:
                         block = response.read(256 * 1024)
                         if not block:
                             break
-                        if count + len(block) > self.pack['bytes']:
+                        if count + len(block) > part['bytes']:
                             raise ValueError('Server sent more data than expected.')
                         output.write(block)
                         count += len(block)
                         now = time.monotonic()
-                        if now - last > .15 or count == self.pack['bytes']:
+                        if now - last > .15 or count == part['bytes']:
                             speed = (count - start_count) / max(.001, now - start)
-                            report(43 + 22 * count / self.pack['bytes'],
-                                   f'Downloading {name} — {count / self.pack["bytes"]:.1%}\n'
-                                   f'{count / 1e9:.2f} / {self.pack["bytes"] / 1e9:.2f} GB • {speed / 1e6:.2f} MB/s')
+                            frac = count / part['bytes']
+                            report(pct_lo + (pct_hi - pct_lo) * frac,
+                                   f'Downloading {part["name"]} — {frac:.1%}\n'
+                                   f'{count / 1e9:.2f} / {part["bytes"] / 1e9:.2f} GB • {speed / 1e6:.2f} MB/s')
                             last = now
-        if not self._verify(partial, lambda p, text: report(66, text)):
+        if not self._verify_part(partial, part, report, pct_hi - 2, pct_hi):
             raise ValueError('Download is incomplete or failed SHA-256 verification. Cached data was kept: ' + str(partial))
         partial.replace(complete)
-        self.downloaded = complete
+        self.downloaded.append(complete)
         return complete
 
-    def _extract_texture_pack(self, payload, stage, report, temp):
-        """Install texture_pack into stage from a folder, 7z archive, or Windows add-on .exe."""
-        dest = stage / 'texture_pack'
-        if payload.is_dir():
-            shutil.copytree(payload, dest, dirs_exist_ok=True)
-            return
-        if payload.suffix.lower() in {'.7z', '.bin'}:
-            tool = shutil.which('7zz') or shutil.which('7z')
-            if not tool:
-                raise ValueError('Install 7-Zip to extract the texture pack: sudo apt install 7zip / sudo dnf install 7zip')
-            log = Path(temp) / '7zip.log'
-            with log.open('wb') as output:
-                process = subprocess.Popen([tool, 'x', '-t7z', '-y', '-bsp1', '-o' + str(stage), str(payload)],
-                                           stdout=output, stderr=subprocess.STDOUT)
-                try:
-                    while process.poll() is None:
-                        if self.cancelled():
-                            raise InterruptedError('Texture extraction stopped. Downloaded data was kept.')
-                        with log.open('rb') as progress_file:
-                            progress_file.seek(max(0, log.stat().st_size - 4096))
-                            matches = re.findall(rb'(\d+)%', progress_file.read())
-                        if matches:
-                            pct = min(100, int(matches[-1]))
-                            report(70 + pct * .2, f'Extracting hi-res textures — {pct}%')
-                        time.sleep(.15)
-                    if process.returncode:
-                        raise ValueError('Texture extraction failed. Downloaded data was kept.')
-                finally:
-                    if process.poll() is None:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-            if not dest.is_dir():
-                raise ValueError('Texture archive did not contain texture_pack/.')
-            return
-        # Windows Inno add-on installer (.exe)
-        tool = shutil.which('innoextract')
+    def _payloads(self, report):
+        if self.cancelled():
+            raise InterruptedError('Download stopped. Run Setup again to resume.')
+        setup = Path(os.environ.get('HITZ_SETUP_DIR', ROOT))
+        folder = setup / 'texture_pack'
+        if (folder / 'manifest.txt').is_file():
+            report(43, 'Using texture_pack beside Setup…')
+            return [folder]
+        parts = self.texture_parts()
+        resolved = []
+        n = max(1, len(parts))
+        for index, part in enumerate(parts):
+            local = setup / part['name']
+            pct_lo = 43 + index * (22 // n)
+            pct_hi = 43 + (index + 1) * (22 // n)
+            if local.is_file():
+                if not self._verify_part(local, part, report, pct_lo, pct_lo + 3):
+                    raise ValueError(
+                        f'{part["name"]} beside Setup is not the required pack part. '
+                        'Move it aside to download the current Revision 2 part.')
+                resolved.append(local)
+                continue
+            resolved.append(self._download_part(part, report, pct_lo, pct_hi))
+        return resolved
+
+    def _extract_one_7z(self, archive, stage, report, temp, label, pct_lo, pct_hi):
+        tool = shutil.which('7zz') or shutil.which('7z')
         if not tool:
-            raise ValueError(
-                'The hi-res pack is a Windows add-on installer. Install innoextract to extract it on Linux '
-                '(sudo dnf install innoextract / sudo apt install innoextract), or place an extracted '
-                'texture_pack folder beside Setup.')
-        extract = Path(temp) / 'inno'
-        extract.mkdir()
-        report(70, 'Extracting the Windows texture add-on with innoextract…')
-        proc = subprocess.run([tool, '-e', '-d', str(extract), str(payload)],
-                              capture_output=True, text=True, timeout=600)
-        if proc.returncode:
-            raise ValueError('innoextract failed:\n' + (proc.stderr or proc.stdout)[-1600:])
-        found = None
-        for candidate in extract.rglob('manifest.txt'):
-            if candidate.parent.name == 'texture_pack' or (candidate.parent / 'rink').is_dir() or (candidate.parent / 'logos').is_dir():
-                found = candidate.parent
-                break
-        if found is None:
-            # Inno may flatten to app/texture_pack
-            for candidate in extract.rglob('texture_pack'):
-                if candidate.is_dir() and (candidate / 'manifest.txt').is_file():
-                    found = candidate
+            raise ValueError('Install 7-Zip to extract the texture pack: sudo dnf install 7zip / sudo apt install 7zip')
+        log = Path(temp) / f'7zip-{label}.log'
+        with log.open('wb') as output:
+            process = subprocess.Popen(
+                [tool, 'x', '-t7z', '-y', '-bsp1', '-o' + str(stage), str(archive)],
+                stdout=output, stderr=subprocess.STDOUT)
+            try:
+                while process.poll() is None:
+                    if self.cancelled():
+                        raise InterruptedError('Texture extraction stopped. Downloaded data was kept.')
+                    with log.open('rb') as progress_file:
+                        progress_file.seek(max(0, log.stat().st_size - 4096))
+                        matches = re.findall(rb'(\d+)%', progress_file.read())
+                    if matches:
+                        pct = min(100, int(matches[-1]))
+                        report(pct_lo + (pct_hi - pct_lo) * pct / 100,
+                               f'Extracting {label} — {pct}%')
+                    time.sleep(.15)
+                if process.returncode:
+                    raise ValueError(f'Texture extraction failed for {label}. Downloaded data was kept.')
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+    def _extract_texture_pack(self, payloads, stage, report, temp):
+        dest = stage / 'texture_pack'
+        if len(payloads) == 1 and payloads[0].is_dir():
+            shutil.copytree(payloads[0], dest, dirs_exist_ok=True)
+            return
+        bins = [path for path in payloads if path.suffix.lower() in {'.bin', '.7z'}]
+        exes = [path for path in payloads if path.suffix.lower() == '.exe']
+        if bins:
+            for index, archive in enumerate(bins):
+                lo = 70 + index * (20 // max(1, len(bins)))
+                hi = 70 + (index + 1) * (20 // max(1, len(bins)))
+                report(lo, f'Extracting {archive.name}…')
+                self._extract_one_7z(archive, stage, report, temp, archive.name, lo, hi)
+            if not dest.is_dir():
+                raise ValueError('Texture archives did not create texture_pack/.')
+            return
+        if len(exes) == 1:
+            tool = shutil.which('innoextract')
+            if not tool:
+                raise ValueError(
+                    'Place texture-01.bin and texture-02.bin (or texture_pack/) beside Setup, '
+                    'or install innoextract for a legacy Windows add-on .exe.')
+            extract = Path(temp) / 'inno'
+            extract.mkdir()
+            report(70, 'Extracting the Windows texture add-on with innoextract…')
+            proc = subprocess.run([tool, '-e', '-d', str(extract), str(exes[0])],
+                                  capture_output=True, text=True, timeout=600)
+            if proc.returncode:
+                raise ValueError('innoextract failed:\n' + (proc.stderr or proc.stdout)[-1600:])
+            found = None
+            for candidate in extract.rglob('manifest.txt'):
+                if candidate.parent.name == 'texture_pack' or (candidate.parent / 'rink').is_dir():
+                    found = candidate.parent
                     break
-        if found is None:
-            raise ValueError('Could not find texture_pack/manifest.txt inside the add-on installer.')
-        shutil.copytree(found, dest)
- 
+            if found is None:
+                for candidate in extract.rglob('texture_pack'):
+                    if candidate.is_dir() and (candidate / 'manifest.txt').is_file():
+                        found = candidate
+                        break
+            if found is None:
+                raise ValueError('Could not find texture_pack/manifest.txt inside the add-on installer.')
+            shutil.copytree(found, dest)
+            return
+        raise ValueError('No usable texture payload was resolved.')
+
     def stage_program(self, stage):
         shutil.copytree(ROOT / 'player', stage, dirs_exist_ok=True)
 
@@ -298,9 +349,13 @@ class ProductionBackend:
         try:
             check = subprocess.run([str(binary), '--build-info'], capture_output=True, text=True, timeout=10)
         except OSError as exc:
-            raise ValueError('The Linux player cannot run on this system. See README-LINUX.txt for runtime requirements.\n' + str(exc)) from exc
+            raise ValueError(
+                'The Linux player cannot run on this system. See README-LINUX.txt for runtime requirements.\n'
+                + str(exc)) from exc
         if check.returncode:
-            raise ValueError('A game runtime dependency is missing or incompatible. See README-LINUX.txt.\n' + check.stderr[-1600:])
+            raise ValueError(
+                'A game runtime dependency is missing or incompatible. See README-LINUX.txt.\n'
+                + check.stderr[-1600:])
         dest = Path(destination).expanduser().resolve()
         self.check_destination(dest)
         existing_game = self.installed_game(dest)
@@ -314,27 +369,41 @@ class ProductionBackend:
                 raise
             except (OSError, ValueError) as exc:
                 if not source or Path(source).expanduser().resolve() == existing_game.resolve():
-                    raise ValueError('The installed game files need a supported disc image or extracted game folder.\n' + str(exc)) from exc
+                    raise ValueError(
+                        'The installed game files need a supported disc image or extracted game folder.\n'
+                        + str(exc)) from exc
         if not reuse_game and not source:
             raise ValueError('Select your Xbox USA disc image or extracted game folder.')
         reuse_textures = self.installed_textures(dest)
         textures = textures and not reuse_textures
-        if textures and not ((Path(os.environ.get('HITZ_SETUP_DIR', ROOT)) / 'texture_pack' / 'manifest.txt').is_file()
-                              or shutil.which('innoextract') or shutil.which('7zz') or shutil.which('7z')):
-            raise ValueError('To install textures: place texture_pack beside Setup, or install innoextract (for the Windows add-on .exe) or 7-Zip.')
+        setup_dir = Path(os.environ.get('HITZ_SETUP_DIR', ROOT))
+        if textures and not ((setup_dir / 'texture_pack' / 'manifest.txt').is_file()
+                              or all((setup_dir / part['name']).is_file() for part in self.texture_parts())
+                              or shutil.which('7zz') or shutil.which('7z') or shutil.which('innoextract')):
+            raise ValueError(
+                'To install textures: place texture_pack/ or texture-01.bin + texture-02.bin beside Setup, '
+                'or install 7-Zip (for the .bin parts).')
         dest.parent.mkdir(parents=True, exist_ok=True)
-        required = (0 if reuse_game else self.metadata['game_bytes']) + self.pack['extracted_bytes'] * bool(textures) + 200_000_000
-        name = self.pack.get('file_name', 'NHLHitzPro-HiRes-Textures-1.exe')
-        local = Path(os.environ.get('HITZ_SETUP_DIR', ROOT)) / name
-        local_folder = Path(os.environ.get('HITZ_SETUP_DIR', ROOT)) / 'texture_pack' / 'manifest.txt'
-        if textures and not local_folder.is_file() and not local.is_file() and not (self.cache / name).is_file():
-            self.cache.mkdir(parents=True, exist_ok=True)
-            partial = self.cache / (name + '.part')
-            remaining = max(0, self.pack['bytes'] - (partial.stat().st_size if partial.exists() else 0))
-            if self.cache.stat().st_dev == dest.parent.stat().st_dev:
-                required += remaining
-            elif shutil.disk_usage(self.cache).free < remaining + 50_000_000:
-                raise ValueError('There is not enough free space in the texture download cache: ' + str(self.cache))
+        required = ((0 if reuse_game else self.metadata['game_bytes'])
+                    + self.pack['extracted_bytes'] * bool(textures) + 200_000_000)
+        if textures and not (setup_dir / 'texture_pack' / 'manifest.txt').is_file():
+            self.cache_root.mkdir(parents=True, exist_ok=True)
+            remaining = 0
+            for part in self.texture_parts():
+                if (setup_dir / part['name']).is_file():
+                    continue
+                complete = self.cache_root / part['sha256'] / part['name']
+                partial = self.cache_root / part['sha256'] / (part['name'] + '.part')
+                have = (complete.stat().st_size if complete.is_file()
+                        else (partial.stat().st_size if partial.exists() else 0))
+                remaining += max(0, part['bytes'] - have)
+            if remaining:
+                if self.cache_root.stat().st_dev == dest.parent.stat().st_dev:
+                    required += remaining
+                elif shutil.disk_usage(self.cache_root).free < remaining + 50_000_000:
+                    raise ValueError(
+                        'There is not enough free space in the texture download cache: '
+                        + str(self.cache_root))
         if shutil.disk_usage(dest.parent).free < required:
             raise ValueError(f'At least {required / 1e9:.2f} GB of free installation space is needed.')
         record_path = dest / '.hitz-linux-install.json'
@@ -345,11 +414,13 @@ class ProductionBackend:
             stage.mkdir()
             report(5, 'Verifying your game source…')
             last = [0.0]
+
             def importing(done, total, name):
                 now = time.monotonic()
                 if now - last[0] > .15 or done == total:
                     last[0] = now
                     report(5 + done / total * 30, f'Extracting game data — {done / total:.1%}\n{name}')
+
             if reuse_game:
                 report(35, 'Keeping the installed game files.')
             else:
@@ -359,11 +430,13 @@ class ProductionBackend:
                 report(36, 'Installing the Linux game and settings application…')
                 self.stage_program(stage)
             if reuse_textures:
-                report(70, 'Keeping the installed texture pack.')
-            payload = self._payload(report) if textures else None
-            if payload:
-                report(70, 'Installing the hi-res texture pack…')
-                self._extract_texture_pack(payload, stage, report, temp)
+                report(70, 'Keeping the installed texture pack (matches Revision %s).'
+                       % self.pack.get('revision', '?'))
+            payloads = self._payloads(report) if textures else None
+            if payloads:
+                report(70, 'Installing the hi-res texture pack (Revision %s)…'
+                       % self.pack.get('revision', '?'))
+                self._extract_texture_pack(payloads, stage, report, temp)
                 manifest = stage / 'texture_pack/manifest.txt'
                 if not manifest.is_file():
                     raise ValueError('Texture pack is missing manifest.txt.')
@@ -375,14 +448,20 @@ class ProductionBackend:
                 for row in rows:
                     if self.cancelled():
                         raise InterruptedError('Installation stopped. Downloaded data was kept.')
-                    expected, size, rel = row.split(' ', 2)
+                    _expected, size, rel = row.split(' ', 2)
                     path = stage / 'texture_pack' / rel
-                    if not path.resolve().is_relative_to(stage / 'texture_pack') or path.is_symlink() or path.stat().st_size != int(size):
+                    if (not path.resolve().is_relative_to(stage / 'texture_pack')
+                            or path.is_symlink() or path.stat().st_size != int(size)):
                         raise ValueError('Missing or invalid extracted texture: ' + rel)
             if self.cancelled():
                 raise InterruptedError('Installation stopped. Downloaded data was kept.')
             if install_program:
-                owned = {p.relative_to(stage).as_posix(): digest(p) for p in stage.rglob('*') if p.is_file() and not p.relative_to(stage).as_posix().startswith(('game_files/', 'texture_pack/'))}
+                owned = {
+                    p.relative_to(stage).as_posix(): digest(p)
+                    for p in stage.rglob('*')
+                    if p.is_file() and not p.relative_to(stage).as_posix().startswith(
+                        ('game_files/', 'texture_pack/'))
+                }
                 (stage / 'install-info.json').write_text(json.dumps(self.metadata, indent=2))
                 owned['install-info.json'] = digest(stage / 'install-info.json')
                 record = {'files': owned, 'shortcuts': old_record.get('shortcuts', {})}
@@ -407,19 +486,22 @@ class ProductionBackend:
     def finish(self, parent):
         if self.downloaded:
             from tkinter import messagebox
-            keep = messagebox.askyesno('Keep texture download?',
-                'Keep the downloaded texture pack for future repairs or reinstalls?\n\n' + str(self.downloaded), parent=parent)
+            listing = '\n'.join(str(path) for path in self.downloaded)
+            keep = messagebox.askyesno(
+                'Keep texture downloads?',
+                'Keep the downloaded texture parts for future repairs or reinstalls?\n\n' + listing,
+                parent=parent)
             if not keep:
-                self.delete_on_exit = self.downloaded
-            self.downloaded = None
+                self.delete_on_exit = list(self.downloaded)
+            self.downloaded = []
 
     def close(self):
-        if self.delete_on_exit:
+        for path in self.delete_on_exit:
             try:
-                self.delete_on_exit.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError:
-                pass  # Cache in use: leave it available rather than fail setup exit.
-            self.delete_on_exit = None
+                pass
+        self.delete_on_exit = []
 
     def launch(self, destination):
         subprocess.Popen([str(Path(destination) / 'play.sh')], start_new_session=True)

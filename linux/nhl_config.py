@@ -130,7 +130,7 @@ class App:
             v = tk.IntVar(); cb = ttk.Checkbutton(tf, text=label, variable=v)
             cb.place(x=30 if i == 0 else 50, y=60 + i * 34); self.tex.append(v); self.texcb.append(cb)
         ttk.Button(tf, text="Open texture pack download page…",
-                   command=lambda: os.system("xdg-open https://github.com/dalves408/nhlhitzpro-recomp/releases/tag/textures-1")).place(
+                   command=lambda: os.system("xdg-open https://github.com/dalves408/nhlhitzpro-recomp/releases/tag/textures-2")).place(
             x=30, y=60 + len(TEX) * 34 + 12, width=280, height=28)
         ttk.Label(tf, text="Hi-res textures live in the game folder's texture_pack/ (installer option) or can be added later.",
                   wraplength=540).place(x=20, y=60 + len(TEX) * 34 + 48)

@@ -99,13 +99,13 @@ def main():
     ap.add_argument('--source', type=Path, required=True)
     ap.add_argument('--project', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
-    ap.add_argument('--version', default='1.0.8-linux')
+    ap.add_argument('--version', default='1.0.9-linux')
     ap.add_argument('--appimagetool', type=Path)
     ap.add_argument('--appimage-runtime', type=Path)
     args = ap.parse_args()
     source, project, output = args.source.resolve(), args.project.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    version, commit = args.version, '62d5238dac6d4b2365fc0b61c6d2a298a595ab01'
+    version, commit = args.version, '99c40d67cf92ff3c0df48c2cfb75d4e0df1a6b74'
     if not re.fullmatch(r'[0-9A-Za-z.-]+', version):
         ap.error('Invalid version label')
     if bool(args.appimagetool) != bool(args.appimage_runtime):
@@ -124,13 +124,27 @@ def main():
         xbe_hash = bytes(map(int, re.search(r'XBE_SHA256\[32\] = \{([^}]+)', header)[1].split(','))).hex()
         (root / 'supported-disc.json').write_text(json.dumps(dict(files=files, xbe_sha256=xbe_hash)))
         texture = dict(
-            file_name='NHLHitzPro-HiRes-Textures-1.exe',
-            url='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-1/NHLHitzPro-HiRes-Textures-1.exe',
-            bytes=1270379322,
-            sha256='dd94fc4cbffe3a923c0a130bf01b2bbd7d1d5758d60d64da7589da7ac8021f3e',
-            extracted_bytes=1268384786,
-            files=None,  # verified via PackManifestSha256 + per-file sizes
-            manifest_sha256='11959780e965f8ac623eea6b7ba7b96c25d4fed1456b72c9a106ca4248f3e403')
+            revision=2,
+            files=6287,
+            extracted_bytes=4970707932,
+            manifest_sha256='073915019f2be011a79ccd238608e3d232e157d1b89459d6b602ac010a66b0bf',
+            parts=[
+                dict(name='texture-01.bin', bytes=1046022933,
+                     sha256='b5a91ce04fc23bec07e334ed23f19b556887e6630fa8b515542d2d251fad4c1f',
+                     url='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-2/texture-01.bin'),
+                dict(name='texture-02.bin', bytes=1717588748,
+                     sha256='6da010784eb9b44bd8d4e973fca3db35b0da494cd17416fe31ec779b583047fb',
+                     url='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-2/texture-02.bin'),
+            ],
+            # Convenience totals for space estimates / summaries
+            bytes=1046022933 + 1717588748,
+            sha256='073915019f2be011a79ccd238608e3d232e157d1b89459d6b602ac010a66b0bf',
+            file_name='texture-01.bin+texture-02.bin',
+            url='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-2/',
+            standalone_setup='NHLHitzPro-HiRes-Textures-2-Setup.exe',
+            standalone_setup_url='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-2/NHLHitzPro-HiRes-Textures-2-Setup.exe',
+            draft_base='https://github.com/dalves408/nhlhitzpro-recomp/releases/download/untagged-717f2cc93031f4eadea2/')
+
         metadata = dict(version=version, source_commit=commit, toolkit_commit='f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b',
             platform='Linux x86-64', texture=texture,
             packaging_patch='HITZ_SHADER_DIR=src/shaders (relative to launcher working directory)',
@@ -209,9 +223,9 @@ Install: sh NHLHitzPro-Setup-{version}-x86_64.run
 Choose a new or existing NHL Hitz Pro installation folder. Setup reuses valid
 game_files and keeps existing texture_pack contents. Provide an Xbox USA
 ISO/XISO or extracted game folder if valid game data is missing.
-Optional hi-res: place NHLHitzPro-HiRes-Textures-1.exe or an extracted texture_pack/
-folder beside Setup to avoid downloading. Otherwise Setup downloads the Windows
-add-on from GitHub (requires innoextract to extract on Linux).
+Optional hi-res (Revision 2): place texture-01.bin + texture-02.bin or an extracted
+texture_pack/ folder beside the AppImage to avoid downloading. Otherwise Setup
+downloads both parts from the textures-2 GitHub release (7-Zip required to extract).
 
 Run play.sh to play, settings.sh to configure. F1 opens in-game settings.
 Requires x86-64 Linux, glibc 2.39+, SDL2, libepoxy, libpng16, and an OpenGL 3.3 driver.

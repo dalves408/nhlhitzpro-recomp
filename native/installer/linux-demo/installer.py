@@ -258,7 +258,7 @@ def gui(backend=None):
                 label('Existing textures detected. Setup will keep them.')
             else:
                 ttk.Checkbutton(body, text='Install the 4x hi-res texture pack', variable=textures).pack(anchor='w')
-                label('Uses NHLHitzPro-HiRes-Textures-1.exe or texture_pack/ beside Setup if available. Otherwise the pack is downloaded. Interrupted downloads can be resumed by running Setup again.')
+                label('Uses texture-01.bin + texture-02.bin (Revision 2) or texture_pack/ beside Setup if available. Otherwise both parts are downloaded. Interrupted downloads can be resumed by running Setup again.')
                 label('Download: 1.85 GB  •  Installed textures: 2.95 GB', 10)
                 if hasattr(backend, 'texture_summary'):
                     label(backend.texture_summary(), 10)
