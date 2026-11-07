@@ -1,17 +1,24 @@
 /* nhl_import: copies the game's data files out of the player's own copy of the disc.
  *
  *   nhl_import <source> <dest_dir>
+ *   nhl_import --prepare <source> <dest_dir>   (RecompLauncher setup: see below)
  *
  * <source> is an Xbox disc image (.iso: a full Redump image or a plain XISO) or a
  * folder holding the game's files (the disc's root, with default.xbe). Only the files
  * listed in manifest.h are written to <dest_dir>, after default.xbe matches the
  * version this build was made from. Progress goes to stdout as "PROGRESS done total".
  *
+ * --prepare is the RecompLauncher "prepare" step (recomplauncher.json): no window, progress as
+ * "progress <0..1> <text>" lines, exit 0 only when <dest_dir> holds a complete, verified copy. The files
+ * are written to a staging folder beside <dest_dir> and swapped in at the end, so a failed or
+ * interrupted run never leaves a half-written game folder (an existing one is kept until then).
+ *
  * Exit codes: 0 ok, 2 source not found, 3 not an Xbox disc image, 4 wrong game or
  * version (default.xbe differs), 5 files missing or the wrong size, 6 cannot write. */
 #include <windows.h>
 #include <bcrypt.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +35,7 @@ static HANDLE g_img = INVALID_HANDLE_VALUE;
 static unsigned long long g_base;
 static int g_err;
 static int g_hash_only;      /* 1 while extracting only default.xbe to hash it */
+static int g_sdk;            /* --prepare: progress in the launcher's "progress <fraction> <text>" form */
 
 static int manifest_find(const char *rel)
 {
@@ -40,7 +48,10 @@ static int manifest_find(const char *rel)
 
 static void progress(void)
 {
-    printf("PROGRESS %llu %llu\n", g_done, (unsigned long long)MANIFEST_BYTES);
+    if (g_sdk)
+        printf("progress %.4f Copying game files\n", 0.05 + 0.9 * (double)g_done / (double)MANIFEST_BYTES);
+    else
+        printf("PROGRESS %llu %llu\n", g_done, (unsigned long long)MANIFEST_BYTES);
     fflush(stdout);
 }
 
@@ -250,24 +261,26 @@ static int find_root(const WCHAR *dir, WCHAR *root)
     return 0;
 }
 
-int wmain(int argc, wchar_t **argv)
+static int run_import(const WCHAR *source, const WCHAR *destination)
 {
     DWORD attr;
     WCHAR root[MAX_PATH], t[MAX_PATH];
     int i, missing = 0;
 
-    if (argc < 3) { printf("usage: nhl_import <iso or folder> <dest folder>\n"); return 2; }
-    wcscpy_s(g_dest, MAX_PATH, argv[2]);
+    g_done = 0; g_found = 0; g_err = 0; g_hash_only = 0; g_base = 0;
+    memset(g_found_flag, 0, sizeof g_found_flag);
+    if (g_img != INVALID_HANDLE_VALUE) { CloseHandle(g_img); g_img = INVALID_HANDLE_VALUE; }
+    wcscpy_s(g_dest, MAX_PATH, destination);
     {
         size_t n = wcslen(g_dest);
         while (n > 3 && (g_dest[n - 1] == L'\\' || g_dest[n - 1] == L'/')) g_dest[--n] = 0;
     }
-    attr = GetFileAttributesW(argv[1]);
+    attr = GetFileAttributesW(source);
     if (attr == INVALID_FILE_ATTRIBUTES) { printf("ERROR The disc image or folder was not found.\n"); return 2; }
 
     if (attr & FILE_ATTRIBUTE_DIRECTORY) {
         int r;
-        if (!find_root(argv[1], root)) { printf("ERROR default.xbe was not found in that folder.\n"); return 4; }
+        if (!find_root(source, root)) { printf("ERROR default.xbe was not found in that folder.\n"); return 4; }
         swprintf_s(t, MAX_PATH, L"%s\\default.xbe", root);
         if (!xbe_ok(t)) { printf("ERROR This is not the supported version of NHL Hitz Pro (default.xbe differs).\n"); return 4; }
         r = copy_folder(root);
@@ -275,7 +288,7 @@ int wmain(int argc, wchar_t **argv)
     } else {
         unsigned long long rs;
         unsigned rsz;
-        g_img = CreateFileW(argv[1], GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+        g_img = CreateFileW(source, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
         if (g_img == INVALID_HANDLE_VALUE) { printf("ERROR The disc image could not be opened.\n"); return 2; }
         if (!find_xdvdfs(&rs, &rsz)) { printf("ERROR This is not an Xbox disc image.\n"); return 3; }
         /* pass 1: default.xbe only, to check the version before copying 1.5 GB */
@@ -294,10 +307,72 @@ int wmain(int argc, wchar_t **argv)
         if (g_err == 6) { printf("ERROR Could not write to the install folder.\n"); return 6; }
         if (g_err) { printf("ERROR The disc image is damaged or incomplete.\n"); return 5; }
         CloseHandle(g_img);
+        g_img = INVALID_HANDLE_VALUE;
     }
     for (i = 0; i < MANIFEST_COUNT; i++)
         if (!g_found_flag[i]) { if (missing++ < 5) printf("MISSING %s\n", MANIFEST[i].path); }
     if (missing) { printf("ERROR %d game files are missing or the wrong size (bad or incomplete dump).\n", missing); return 5; }
     printf("OK %u files\n", g_found);
     return 0;
+}
+
+/* Delete a folder tree (path without a trailing backslash). */
+static void remove_tree(const WCHAR *dir)
+{
+    WCHAR buf[MAX_PATH + 2];
+    SHFILEOPSTRUCTW op;
+    size_t n = wcslen(dir);
+    if (n == 0 || n >= MAX_PATH) return;
+    memcpy(buf, dir, (n + 1) * sizeof(WCHAR));
+    buf[n + 1] = 0;
+    memset(&op, 0, sizeof op);
+    op.wFunc = FO_DELETE; op.pFrom = buf;
+    op.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    SHFileOperationW(&op);
+}
+
+static int sdk_prepare(const WCHAR *source, const WCHAR *destination)
+{
+    WCHAR dest[MAX_PATH], stage[MAX_PATH], backup[MAX_PATH], parent[MAX_PATH], *sl;
+    DWORD n = GetFullPathNameW(destination, MAX_PATH, dest, NULL), attr;
+    int r, had_old = 0;
+
+    g_sdk = 1;
+    while (n > 3 && (dest[n - 1] == L'\\' || dest[n - 1] == L'/')) dest[--n] = 0;
+    if (!n || n >= MAX_PATH - 64) { printf("ERROR The game folder path is not usable.\n"); return 6; }
+    swprintf_s(stage, MAX_PATH, L"%s.stage-%lu", dest, (unsigned long)GetCurrentProcessId());
+    swprintf_s(backup, MAX_PATH, L"%s.old-%lu", dest, (unsigned long)GetCurrentProcessId());
+    wcscpy_s(parent, MAX_PATH, dest);
+    sl = wcsrchr(parent, L'\\');
+    if (sl) { *sl = 0; SHCreateDirectoryExW(NULL, parent, NULL); }
+    puts("progress 0.02 Checking your Xbox game source");
+    fflush(stdout);
+    remove_tree(stage);                              /* left over from an interrupted run */
+    r = run_import(source, stage);
+    if (r) { remove_tree(stage); return r; }
+    attr = GetFileAttributesW(dest);
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+        if (!(attr & FILE_ATTRIBUTE_DIRECTORY) || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            printf("ERROR The game folder is not a plain folder.\n"); remove_tree(stage); return 6;
+        }
+        if (!MoveFileW(dest, backup)) { printf("ERROR Could not replace the old game files.\n"); remove_tree(stage); return 6; }
+        had_old = 1;
+    }
+    if (!MoveFileW(stage, dest)) {
+        printf("ERROR Could not put the game files in place.\n");
+        if (had_old) MoveFileW(backup, dest);
+        remove_tree(stage);
+        return 6;
+    }
+    if (had_old) remove_tree(backup);
+    puts("progress 1 Game files are ready");
+    fflush(stdout);
+    return 0;
+}
+
+int wmain(int argc, wchar_t **argv)
+{
+    if (argc == 4 && !wcscmp(argv[1], L"--prepare")) return sdk_prepare(argv[2], argv[3]);
+    if (argc < 3) { printf("usage: nhl_import <iso or folder> <dest folder> | --prepare <iso or folder> <dest folder>\n"); return 2; }
+    return run_import(argv[1], argv[2]);
 }

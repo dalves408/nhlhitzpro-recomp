@@ -219,6 +219,111 @@ static int s_hires = 1;           /* F1 "Hi-res textures" (settings.ini [texture
 static int s_cat_on[5] = { 1, 1, 1, 1, 1 };   /* texture pack folders rink, logos, jerseys, glow, other (config.exe Textures tab) */
 static int s_tex_flush;           /* re-check every cached texture against the pack */
 static unsigned s_pack_hits[5];   /* replacements loaded per kind (log) */
+/* Bytes per 4x4 block for block-compressed formats, 0 for the 32-bit uncompressed ones, -1 unsupported. */
+static int dds_block_bytes(DXGI_FORMAT f)
+{
+    switch (f) {
+    case DXGI_FORMAT_BC1_UNORM: return 8;
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC7_UNORM: return 16;
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM: return 0;
+    default: return -1;
+    }
+}
+
+static size_t dds_level(DXGI_FORMAT f, uint32_t w, uint32_t h, UINT *pitch)
+{
+    int bb = dds_block_bytes(f);
+    if (bb > 0) {
+        *pitch = ((w + 3) / 4) * (UINT)bb;
+        return (size_t)*pitch * ((h + 3) / 4);
+    }
+    *pitch = w * 4;
+    return (size_t)*pitch * h;
+}
+
+static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+
+/* Load DDS levels directly into a shader resource. Validate the header and
+ * mip footprint before allocating or reading the payload. */
+static int pack_load_dds(const char *path, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv)
+{
+    uint8_t header[148];
+    D3D11_TEXTURE2D_DESC td = {0};
+    D3D11_SUBRESOURCE_DATA levels[15] = {0};
+    FILE *f = fopen(path, "rb");
+    uint8_t *data = NULL;
+    uint32_t w, h, max_mips, i;
+    size_t offset = 128, size = 0;
+    long file_size;
+    HRESULT hr = E_FAIL;
+
+    if (!f) return 0;
+    if (fread(header, 1, 128, f) != 128 || memcmp(header, "DDS ", 4) ||
+        rd32(header + 4) != 124 || rd32(header + 76) != 32 ||
+        (rd32(header + 112) & 0x0020FE00u)) goto out; /* cubemaps and volumes */
+    td.Height = rd32(header + 12);
+    td.Width = rd32(header + 16);
+    td.MipLevels = rd32(header + 28);
+    if (!td.MipLevels) td.MipLevels = 1;
+    if (!td.Width || !td.Height || td.Width > 16384 || td.Height > 16384) goto out;
+    for (w = td.Width > td.Height ? td.Width : td.Height, max_mips = 0; w; w >>= 1) max_mips++;
+    if (td.MipLevels > max_mips) goto out;
+
+    if (rd32(header + 80) & 4) {
+        if (!memcmp(header + 84, "DX10", 4)) {
+            if (fread(header + 128, 1, 20, f) != 20 || rd32(header + 132) != 3 ||
+                (rd32(header + 136) & 4) || rd32(header + 140) != 1) goto out;
+            td.Format = (DXGI_FORMAT)rd32(header + 128);
+            offset = 148;
+        } else if (!memcmp(header + 84, "DXT1", 4)) td.Format = DXGI_FORMAT_BC1_UNORM;
+        else if (!memcmp(header + 84, "DXT3", 4)) td.Format = DXGI_FORMAT_BC2_UNORM;
+        else if (!memcmp(header + 84, "DXT5", 4)) td.Format = DXGI_FORMAT_BC3_UNORM;
+    } else if ((rd32(header + 80) & 0x40) && rd32(header + 88) == 32 &&
+               rd32(header + 96) == 0xFF00 && rd32(header + 104) == 0xFF000000u) {
+        if (rd32(header + 92) == 0xFF0000 && rd32(header + 100) == 0xFF)
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        else if (rd32(header + 92) == 0xFF && rd32(header + 100) == 0xFF0000)
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    if (dds_block_bytes(td.Format) < 0) goto out;
+    if (dds_block_bytes(td.Format) && ((td.Width & 3) || (td.Height & 3))) goto out;
+
+    for (i = 0, w = td.Width, h = td.Height; i < td.MipLevels; i++) {
+        levels[i].SysMemSlicePitch = (UINT)dds_level(td.Format, w, h, &levels[i].SysMemPitch);
+        size += levels[i].SysMemSlicePitch;
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+    }
+    if (fseek(f, 0, SEEK_END) || (file_size = ftell(f)) < 0 ||
+        offset + size > (size_t)file_size || fseek(f, (long)offset, SEEK_SET)) goto out;
+    data = (uint8_t *)malloc(size);
+    if (!data || fread(data, 1, size, f) != size) goto out;
+    for (i = 0, offset = 0; i < td.MipLevels; i++) {
+        levels[i].pSysMem = data + offset;
+        offset += levels[i].SysMemSlicePitch;
+    }
+
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(g.dev, &td, levels, tex);
+    if (SUCCEEDED(hr)) {
+        hr = ID3D11Device_CreateShaderResourceView(g.dev, (ID3D11Resource *)*tex, NULL, srv);
+        if (FAILED(hr)) { ID3D11Texture2D_Release(*tex); *tex = NULL; }
+        else {
+            static unsigned logged;
+            if (g.log && logged++ < 8)
+                logf_("DDS replacement %ux%u fmt %u, %u mips: %s\n",
+                      td.Width, td.Height, td.Format, td.MipLevels, path);
+        }
+    }
+out:
+    free(data);
+    fclose(f);
+    return SUCCEEDED(hr);
+}
+
 static void pack_init(void);
 static int pack_installed(void);
 static const unsigned SET_FPS_HZ[6] = { 30, 60, 120, 144, 240, 360 };   /* the last is "uncapped": more only costs CPU (1000 measured slower) */
@@ -1783,11 +1888,15 @@ static uint64_t px_hash(uint32_t w, uint32_t hh, const uint32_t *px)
 }
 
 /* ---- texture replacement pack ----
- * Files named <16 hex digits of the texture's content hash>*.png|bmp (as written by RECOMP_TEXDUMP_ALL) in the
+ * Files named <16 hex digits of the texture's content hash>*.dds|png|bmp (as written by RECOMP_TEXDUMP_ALL) in the
  * folder RECOMP_TEXPACK, or %LOCALAPPDATA%\NHLHitzPro\texture_pack, are used in place of the decoded texture.
  * The replacement may be any size; the game's texture coordinates are scaled by the original size, so
  * a 4x image simply samples sharper. Pack textures always get a mip chain. */
-typedef struct { uint64_t hash; uint8_t cat; char path[MAX_PATH]; } PackFile;   /* cat: 0 rink, 1 logos, 2 jerseys, 3 glow, 4 other */
+typedef struct {
+    uint64_t hash;
+    uint8_t cat, dds_cat;
+    char path[MAX_PATH], dds_path[MAX_PATH];
+} PackFile;   /* cat: 0 rink, 1 logos, 2 jerseys, 3 glow, 4 other */
 static PackFile *s_pack;
 static int s_npack, s_pack_init;
 static uint32_t *s_pack_px;
@@ -1804,6 +1913,7 @@ static void pack_scan(const char *dir, int depth, int cat)
     do {
         char full[MAX_PATH];
         size_t n = strlen(fd.cFileName);
+        int dds = n > 20 && !_stricmp(fd.cFileName + n - 4, ".dds");
         if (fd.cFileName[0] == '.') continue;
         snprintf(full, sizeof full, "%s\\%s", dir, fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
@@ -1819,22 +1929,33 @@ static void pack_scan(const char *dir, int depth, int cat)
             }
             continue;
         }
-        if (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".bmp"))) {
+        if (dds || (n > 20 && (!_stricmp(fd.cFileName + n - 4, ".png") || !_stricmp(fd.cFileName + n - 4, ".bmp")))) {
             char hx[17];
-            int i, ok = 1, dup = 0;
+            int i, ok = 1;
             uint64_t v;
             memcpy(hx, fd.cFileName, 16); hx[16] = 0;
             for (i = 0; i < 16; i++) if (!isxdigit((unsigned char)hx[i])) ok = 0;
             if (!ok) continue;
             v = _strtoui64(hx, NULL, 16);
-            for (i = 0; i < s_npack; i++) if (s_pack[i].hash == v) { dup = 1; break; }
-            if (dup) continue;
-            if ((s_npack & 255) == 0) s_pack = (PackFile *)realloc(s_pack, sizeof(PackFile) * (size_t)(s_npack + 256));
-            if (!s_pack) { s_npack = 0; break; }
-            s_pack[s_npack].hash = v;
-            s_pack[s_npack].cat = (uint8_t)cat;
-            snprintf(s_pack[s_npack].path, MAX_PATH, "%s", full);
-            s_npack++;
+            for (i = 0; i < s_npack; i++) if (s_pack[i].hash == v) break;
+            if (i == s_npack) {
+                if ((s_npack & 255) == 0) {
+                    PackFile *grown = (PackFile *)realloc(s_pack, sizeof *s_pack * (size_t)(s_npack + 256));
+                    if (!grown) break;
+                    s_pack = grown;
+                }
+                memset(&s_pack[i], 0, sizeof s_pack[i]);
+                s_pack[i].hash = v;
+                s_npack++;
+            }
+            /* Keep the first path of each type and retain the image fallback. */
+            if (dds && !s_pack[i].dds_path[0]) {
+                snprintf(s_pack[i].dds_path, MAX_PATH, "%s", full);
+                s_pack[i].dds_cat = (uint8_t)cat;
+            } else if (!dds && !s_pack[i].path[0]) {
+                snprintf(s_pack[i].path, MAX_PATH, "%s", full);
+                s_pack[i].cat = (uint8_t)cat;
+            }
         }
     } while (FindNextFileA(h, &fd));
     FindClose(h);
@@ -1905,19 +2026,13 @@ static int pack_installed(void)
     return s_npack > 0;
 }
 
-static const uint32_t *pack_lookup(uint64_t hash, uint32_t *w, uint32_t *hh)
+static const PackFile *pack_lookup(uint64_t hash)
 {
     int i;
+    if (!hash || !s_hires || s_scale < 2) return NULL;
     pack_init();
-    if (!hash || !s_npack || !s_hires || s_scale < 2) return NULL;     /* the 4x pictures need Render Scale 2x or more */
     for (i = 0; i < s_npack; i++)
-        if (s_pack[i].hash == hash) {
-            const uint32_t *r;
-            if (!s_cat_on[s_pack[i].cat]) return NULL;
-            r = pack_load(s_pack[i].path, w, hh);
-            if (r) s_pack_hits[s_pack[i].cat]++;
-            return r;
-        }
+        if (s_pack[i].hash == hash) return &s_pack[i];
     return NULL;
 }
 
@@ -1927,11 +2042,14 @@ static TexEntry *get_texture(const Nv2aTexture *t)
     int i;
     if (s_tex_flush) {                    /* F1 Hi-res textures switched: every cached texture is checked again */
         s_tex_flush = 0;
-        for (i = 0; i < s_ntex; i++) { s_tex[i].hash = ~0ull; s_tex[i].sample = ~0ull; s_tex[i].full_us = 0; }
+        for (i = 0; i < s_ntex; i++) { s_tex[i].hash = ~0ull; s_tex[i].sample = ~0ull; s_tex[i].full_us = 0; s_tex[i].hash_flip = ~g.flips; }
     }
     uint64_t h = 0, t0, ph = 0;
     size_t span, need;
-    const uint32_t *rp;
+    const PackFile *pack;
+    const uint32_t *rp = NULL;
+    ID3D11Texture2D *dds_tex = NULL;
+    ID3D11ShaderResourceView *dds_srv = NULL;
     uint32_t rw_ = 0, rh_ = 0;
     int remake = 0;
 
@@ -2046,8 +2164,17 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
     }
 
-    rp = pack_lookup(ph, &rw_, &rh_);
-    if (e && (rp || e->repl)) {                          /* size changes: remake the GPU texture */
+    pack = pack_lookup(ph);
+    if (pack) {
+        if (pack->dds_path[0] && s_cat_on[pack->dds_cat] &&
+            pack_load_dds(pack->dds_path, &dds_tex, &dds_srv)) {
+            s_pack_hits[pack->dds_cat]++;
+        } else if (pack->path[0] && s_cat_on[pack->cat]) {
+            rp = pack_load(pack->path, &rw_, &rh_);
+            if (rp) s_pack_hits[pack->cat]++;
+        }
+    }
+    if (e && (dds_tex || rp || e->repl)) {                          /* size changes: remake the GPU texture */
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         if (e->tex) ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
@@ -2065,8 +2192,8 @@ static TexEntry *get_texture(const Nv2aTexture *t)
             int w = 0;
             for (i = 1; i < MAX_TEX; i++) if (s_tex[i].last_use < s_tex[w].last_use) w = i;
             e = &s_tex[w];
-            ID3D11ShaderResourceView_Release(e->srv);
-            ID3D11Texture2D_Release(e->tex);
+            if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+            if (e->tex) ID3D11Texture2D_Release(e->tex);
         }
         memset(e, 0, sizeof *e);
         memset(&td, 0, sizeof td);
@@ -2076,7 +2203,11 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         sd.pSysMem = up; sd.SysMemPitch = uw * 4; sd.SysMemSlicePitch = 0;
-        if ((tex_want_mips() || rp) && uw >= 4 && uh >= 4) {
+        if (dds_tex) {
+            e->tex = dds_tex;
+            e->srv = dds_srv;
+            hr = S_OK;
+        } else if ((tex_want_mips() || rp) && uw >= 4 && uh >= 4) {
             td.MipLevels = 0;                                    /* the full chain */
             td.BindFlags |= D3D11_BIND_RENDER_TARGET;            /* GenerateMips needs it */
             td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
@@ -2105,7 +2236,7 @@ static TexEntry *get_texture(const Nv2aTexture *t)
         }
         e->off = t->offset; e->color = t->color; e->w = t->width; e->h = t->height;
         e->pitch = t->pitch;
-        e->repl = rp != NULL;
+        e->repl = dds_tex != NULL || rp != NULL;
         if (g.log && s_ntex <= 40)
             logf_("new texture off 0x%08X fmt 0x%X %ux%u pitch %u\n", t->offset, t->color,
                   t->width, t->height, t->pitch);
@@ -3293,6 +3424,10 @@ static int settings_path(char *out, size_t n)
 static int want_fullscreen_at_start(void)
 {
     char path[MAX_PATH];
+    {   /* RecompLauncher in Big Picture mode: always fullscreen, whatever the saved setting is (not saved); "desktop" or no launcher: the saved setting */
+        const char *m = getenv("RECOMPLAUNCHER_MODE");
+        if (m && _stricmp(m, "bigpicture") == 0) return 1;
+    }
     if (!settings_path(path, sizeof path)) return 1;
     return GetPrivateProfileIntA("display", "fullscreen", 1, path) != 0;
 }
