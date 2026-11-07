@@ -1,6 +1,6 @@
 # NHL Hitz Pro for PC
 
-A native Windows build of **NHL Hitz Pro** (original Xbox, 2003, USA release), made by statically recompiling the game with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit. It plays the intro movies, menus, team select and full matches at 60 fps on a current PC.
+A native Windows (and Linux) build of **NHL Hitz Pro** (original Xbox, 2003, USA release), made by statically recompiling the game with the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit. It plays the intro movies, menus, team select and full matches at 60 fps on a current PC.
 
 This project contains **no game content**. You need your own copy of the Xbox disc.
 
@@ -12,14 +12,14 @@ This project contains **no game content**. You need your own copy of the Xbox di
 - A GPU with Direct3D 11 support (any from the last decade)
 - A multi-core CPU (the game's vertex work and audio run on the CPU)
 - On a laptop with two graphics chips (NVIDIA Optimus, AMD switchable) the game asks Windows for the faster one
-- About 2 GB of free disk space (plus about 1.3 GB for the optional hi-res texture pack)
+- About 2 GB of free disk space (plus about 5 GB for the optional hi-res texture pack)
 - Your own **NHL Hitz Pro (USA)** disc, as an `.iso` / `.xiso` image or as a folder with the game's files (the folder that holds `default.xbe`)
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.8.exe` and choose where to install.
+1. Run `NHLHitzPro-Setup-1.0.9.exe` and choose where to install. A fresh install suggests `C:\Games\NHL Hitz Pro`; if the game is already installed, its folder is suggested instead. You can change the folder either way.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
-3. On the **Hi-res texture pack** page, tick the box to add the 4x texture pack (see below). It is optional.
+3. Optionally tick the **hi-res texture pack** task to add the 4x texture pack (see below). It is off by default.
 4. Start **NHL Hitz Pro** from the Start menu.
 
 If the game is already installed, Setup says so and shows the installed version and the new one. A different version only updates the program files after you confirm (no disc needed, game files and saves kept); the same version offers Repair or Quit.
@@ -46,7 +46,11 @@ XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to 
 
 **Changing the keyboard keys** (Controls tab): pick an action, click Change key and press the key you want; each action also has an alternate key. Save applies the keys the next time the game starts, and Reset to defaults brings the original layout back. Esc, F11 and Alt+Enter are used by the game itself and can't be assigned. The choices are stored in `%LOCALAPPDATA%\NHLHitzPro\keymap.ini`.
 
-**Hi-res texture pack (optional):** 1,910 textures redrawn at 4x resolution: the ice, boards and glass, team logos, jerseys and numbers, faces and more. It is a separate 1.27 GB add-on. The game installer's **Hi-res texture pack** page installs it: if `NHLHitzPro-HiRes-Textures-1.exe` is in the same folder as the installer it uses that file, otherwise it offers to download it (the download is checked before use). The add-on can also be run on its own after the game is installed. When Setup runs again later, it checks the installed pack file by file against the current release and offers to update or repair it. The pack lives in `<install folder>\texture_pack`; pictures placed in `%LOCALAPPDATA%\NHLHitzPro\texture_pack` override the same texture. A replacement picture is matched by the first 16 hex characters of its file name (a hash of the original texture's pixels) and can be a PNG or BMP of any size. The pack's textures are sorted into folders (`rink`, `logos`, `jerseys`, `glow`, `other`). The settings program's **Textures** tab has a master switch and one checkbox per kind (greyed out with a download button when no pack is installed), and the F1 menu has a **Hi-res textures** line that turns the whole pack on or off while you play. The 4x pictures are only used at **Render Scale 2x or higher**; at 1x (native) the switch is dark and the original textures are shown.
+**Hi-res texture pack (optional, Revision 2):** 6,287 textures redrawn at 4x resolution as BC7 DDS files: the ice, boards and glass, team logos, jerseys and numbers, faces and more. It needs game version 1.0.9 or newer. It is a separate add-on on the [textures-2](https://github.com/dalves408/nhlhitzpro-recomp/releases/tag/textures-2) release: a small `NHLHitzPro-HiRes-Textures-2-Setup.exe` plus two data files, `texture-01.bin` (about 1 GB) and `texture-02.bin` (about 1.6 GB); it takes about 5 GB on disk once installed. The game installer's hi-res texture task installs it, or you can run the add-on on its own after the game is installed. For an offline install, put both `.bin` files in the same folder as Setup; otherwise Setup downloads any missing part (it resumes, and checks each part's size and SHA-256 before use). A Revision 1 pack is cleaned up after Revision 2 is installed. The pack lives in `<install folder>\texture_pack`; pictures placed in `%LOCALAPPDATA%\NHLHitzPro\texture_pack` override the same texture. A replacement picture is matched by the first 16 hex characters of its file name (a hash of the original texture's pixels) and can be a DDS (BC1, BC2, BC3, BC7 or uncompressed), PNG or BMP of any size. The settings program's **Textures** tab has a master switch and one checkbox per kind (greyed out with a download button when no pack is installed), and the F1 menu has a **Hi-res textures** line that turns the whole pack on or off while you play. The 4x pictures are only used at **Render Scale 2x or higher**; at 1x (native) the switch is dark and the original textures are shown.
+
+**RecompLauncher:** the release also has `NHLHitzPro-v1.0.9-Windows-x64.zip` for [RecompLauncher](https://recomplauncher.com) (Level 3): it picks your disc image, imports the game files (`nhl_import.exe --prepare`) and shows the video settings. When RecompLauncher starts the game in Big Picture mode, the game runs in borderless fullscreen; in desktop mode it uses your saved setting. The normal installer is for everyone else. See `native/RECOMPLAUNCHER.md`.
+
+**Linux:** version 1.0.9 also has a first Linux release (x86-64, OpenGL): a Standalone AppImage with a Setup wizard, a settings app, disc import and the Revision 2 texture install (`chmod +x` it, then run it; `--setup` and `--settings` open those). There is also a tar.gz for RecompLauncher. See `native/installer/linux/README.md`.
 
 **Known issues**
 
@@ -84,7 +88,7 @@ cmake -S native -B native/build-release -DNHL_RELEASE=ON
 cmake --build native/build-release --config Release --target nhl_hitz_pro_recomp nhl_import
 ```
 
-The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup). `native/installer/gen_manifest.py` regenerates the list of disc files and the `default.xbe` hash it checks. The texture pack add-on is built from `native/installer/nhl_hitz_pro_textures.iss`; `gen_pack_manifest.py` writes the pack's file list (`manifest.txt`) and the release data (`pack_release.iss`: file name, size, SHA-256 and download address) that the game installer checks.
+The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup); `scripts/recomplauncher_manifest.py` builds the RecompLauncher ZIP. `native/installer/gen_manifest.py` regenerates the list of disc files and the `default.xbe` hash it checks. The texture pack add-on is built from `native/installer/nhl_hitz_pro_textures.iss`; `gen_pack_manifest.py` writes the pack's file list (`manifest.txt`) and the release data (`pack_release.iss`: file name, size, SHA-256 and download address) that the game installer checks.
 
 ## Debug builds and other branches
 
