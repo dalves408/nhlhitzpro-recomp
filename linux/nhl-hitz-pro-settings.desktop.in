@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NHL Hitz Pro Settings
+Exec=@REPO@/linux/settings.sh
+Path=@REPO@
+Icon=nhlhitzpro
+Terminal=false
+Categories=Game;SportsGame;Settings;

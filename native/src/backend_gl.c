@@ -16,6 +16,95 @@
 #include "linux_performance.h"
 #include "linux_gpu_wait.h"
 
+#include <png.h>
+#include <unistd.h>
+#include <limits.h>
+
+/* Installer places Pro icon.png next to play.sh; also try beside the ELF. */
+static void hitz_set_window_icon(SDL_Window *win)
+{
+    char exe[PATH_MAX];
+    char paths[5][PATH_MAX];
+    int count = 0;
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len > 0) {
+        char *slash;
+        exe[len] = 0;
+        slash = strrchr(exe, '/');
+        if (slash) {
+            *slash = 0;
+            snprintf(paths[count++], PATH_MAX, "%s/icon.png", exe);
+            snprintf(paths[count++], PATH_MAX, "%s/../icon.png", exe);
+            snprintf(paths[count++], PATH_MAX, "%s/../../icon.png", exe);
+        }
+    }
+    snprintf(paths[count++], PATH_MAX, "%s", "icon.png");
+    snprintf(paths[count++], PATH_MAX, "%s", "../icon.png");
+    for (int i = 0; i < count; i++) {
+        const char *file = paths[i];
+        FILE *fp = fopen(file, "rb");
+        png_structp png;
+        png_infop info;
+        png_uint_32 w, h;
+        int depth, color;
+        png_bytep *rows = NULL;
+        unsigned char *pixels = NULL;
+        SDL_Surface *surf = NULL;
+        int ok = 0;
+        if (!fp)
+            continue;
+        png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+        info = png ? png_create_info_struct(png) : NULL;
+        if (!png || !info || setjmp(png_jmpbuf(png))) {
+            if (png) png_destroy_read_struct(&png, info ? &info : NULL, NULL);
+            fclose(fp);
+            continue;
+        }
+        png_init_io(png, fp);
+        png_read_info(png, info);
+        w = png_get_image_width(png, info);
+        h = png_get_image_height(png, info);
+        depth = png_get_bit_depth(png, info);
+        color = png_get_color_type(png, info);
+        if (depth == 16) png_set_strip_16(png);
+        if (color == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+        if (color == PNG_COLOR_TYPE_GRAY && depth < 8) png_set_expand_gray_1_2_4_to_8(png);
+        if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+        if (color == PNG_COLOR_TYPE_RGB || color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_PALETTE)
+            png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+        if (color == PNG_COLOR_TYPE_GRAY || color == PNG_COLOR_TYPE_GRAY_ALPHA)
+            png_set_gray_to_rgb(png);
+        png_set_bgr(png);
+        png_read_update_info(png, info);
+        pixels = (unsigned char *)malloc((size_t)w * h * 4);
+        rows = (png_bytep *)malloc(sizeof(*rows) * h);
+        if (pixels && rows) {
+            for (png_uint_32 y = 0; y < h; y++)
+                rows[y] = pixels + (size_t)y * w * 4;
+            png_read_image(png, rows);
+            surf = SDL_CreateRGBSurfaceFrom(pixels, (int)w, (int)h, 32, (int)w * 4,
+#if SDL_BYTEORDER == SDL_BIG_ENDIAN
+                0xff000000, 0x00ff0000, 0x0000ff00, 0x000000ff
+#else
+                0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+#endif
+            );
+            if (surf) {
+                SDL_SetWindowIcon(win, surf);
+                SDL_FreeSurface(surf);
+                fprintf(stderr, "[GL] window icon: %s (%ux%u)\n", file, (unsigned)w, (unsigned)h);
+                ok = 1;
+            }
+        }
+        free(rows);
+        free(pixels);
+        png_destroy_read_struct(&png, &info, NULL);
+        fclose(fp);
+        if (ok)
+            return;
+    }
+}
+
 typedef struct { uint32_t va,w,h,format; GLuint fbo,color,depth,attached_depth; int attached_depth_texture; unsigned uses; GLuint msfbo,mscolor; int ms,dirty; } Target;
 /* JOJO item 18: MSAA as in backend_d3d11.c. With msaa>1 every render target is
  * drawn into a multisampled colour+depth framebuffer (msfbo) and resolved into
@@ -176,6 +265,7 @@ static void init(void)
     window=SDL_CreateWindow("NHL Hitz Pro — Linux",SDL_WINDOWPOS_CENTERED,
         SDL_WINDOWPOS_CENTERED,960,720,SDL_WINDOW_OPENGL|SDL_WINDOW_RESIZABLE);
     if(!window || !(context=SDL_GL_CreateContext(window)))fatal("OpenGL window");
+    hitz_set_window_icon(window);
     ov_settings_load();   /* JOJO item 14: settings.ini fills in unset RECOMP_* */
     /* JOJO item 9: RECOMP_GL_FULLSCREEN=1 starts in desktop fullscreen (same as F11). */
     {const char *fs=getenv("RECOMP_GL_FULLSCREEN");if(fs&&fs[0]=='1'){SDL_SetWindowFullscreen(window,SDL_WINDOW_FULLSCREEN_DESKTOP);fprintf(stderr,"[GL] fullscreen (desktop)\n");}}
