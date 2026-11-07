@@ -3,6 +3,22 @@
 Ports the NHL Hitz 2003 Linux Setup wizard (`gui` + `ProductionBackend`) to Pro
 with Pro branding, the Pro app icon, and Pro texture-pack handling.
 
+
+## Primary artifact: Standalone AppImage
+
+Same deliverable style as NHL Hitz 2003 (`NHLHitz2003-*-Standalone.AppImage`):
+
+```sh
+python3 scripts/build_linux_test_installer.py \
+  --source "$PWD" --project "$PWD" \
+  --output native/installer/Output/linux --version 1.0.8-linux \
+  --appimagetool /path/to/appimagetool-x86_64.AppImage \
+  --appimage-runtime /path/to/runtime-x86_64
+```
+
+Produces `NHLHitzPro-<version>-Standalone.AppImage` (and a RecompLauncher `.tar.gz`).
+Without `--appimagetool` / `--appimage-runtime`, the builder falls back to a `.run` self-extractor (optional).
+
 ## Options (parity with 2003)
 
 | Option | Behavior |
