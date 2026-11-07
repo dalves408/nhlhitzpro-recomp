@@ -455,3 +455,11 @@ begin
   if not GameFilesPresent(ExpandConstant('{app}')) or (WantTexturePack and not TexturePackInstalled) then
     Result := 1;
 end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  { Rev2 textures register a separate ARP entry (extraction-only, no unins000). }
+  if CurUninstallStep = usPostUninstall then
+    RegDeleteKeyIncludingSubkeys(HKCU,
+      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1');
+end;

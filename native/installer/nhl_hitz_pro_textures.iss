@@ -6,9 +6,6 @@
 #ifndef BuildDir
 #define BuildDir "..\build-release\Release"
 #endif
-#ifndef PackGuid
-#define PackGuid "02D24D7F-1562-48D0-9A40-B559C7BE3EA9"
-#endif
 #ifndef GameGuid
 #define GameGuid "6F1D2B7E-3C54-4A8B-9E10-4C0D7A55B1E2"
 #endif

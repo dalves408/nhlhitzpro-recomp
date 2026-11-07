@@ -4,6 +4,12 @@
 #ifndef TextureVersion
 #define TextureVersion "2"
 #endif
+#ifndef TextureDisplayVersion
+#define TextureDisplayVersion "Revision 2"
+#endif
+#ifndef PackGuid
+#define PackGuid "02D24D7F-1562-48D0-9A40-B559C7BE3EA9"
+#endif
 #ifndef TextureExtractedBytes
 #define TextureExtractedBytes 4970707932
 #endif
