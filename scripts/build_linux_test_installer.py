@@ -105,7 +105,7 @@ def main():
     args = ap.parse_args()
     source, project, output = args.source.resolve(), args.project.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    version, commit = args.version, '99c40d67cf92ff3c0df48c2cfb75d4e0df1a6b74'
+    version, commit = args.version, 'be8fcaa052a8731d34c5bcb7fcc192d4552972dc'
     if not re.fullmatch(r'[0-9A-Za-z.-]+', version):
         ap.error('Invalid version label')
     if bool(args.appimagetool) != bool(args.appimage_runtime):
