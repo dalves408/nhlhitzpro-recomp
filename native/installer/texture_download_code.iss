@@ -23,6 +23,8 @@ function TextureTick: LongWord;
 function GetFileAttributes(FileName: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
 
+procedure RegisterTexturePackEntry(AppDir: String); forward;
+
 function TextureForceRepair: Boolean;
 begin
   Result := ExpandConstant('{param:REPAIRTEXTURES|0}') = '1';
@@ -271,6 +273,9 @@ begin
   TexturePackInstalled := TexturePackAlreadyCurrent;
   if TexturePackAlreadyCurrent then begin
     Log('The current texture pack is already installed; no download or extraction is needed.');
+    { Refresh Programs and Features even when extraction is skipped, so a
+      leftover Revision 1 ARP entry is replaced with Revision 2. }
+    RegisterTexturePackEntry(WizardDirValue);
     Exit;
   end;
   if not GetSpaceOnDisk64(AddBackslash(ExtractFileDrive(WizardDirValue)), FreeBytes, TotalBytes) then begin
@@ -336,6 +341,7 @@ end;
 
 const
   LegacyPackKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B3A5C2D4-7E91-4F0A-8C36-2D5E9A41F7B8}_is1';
+  TexturePackKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1';
 
 function LegacyPackRegistered(Root: Integer; AppDir: String): Boolean;
 var Dir, Version: String;
@@ -361,6 +367,33 @@ begin
     DeleteFile(ChangeFileExt(LegacyExe, '.msg'));
   end;
   Log('Removed the revision 1 texture add-on registration.');
+end;
+
+{ Extraction-only Rev2 has CreateUninstallRegKey=no; write ARP manually so
+  Programs and Features shows DisplayVersion "Revision 2" (not stale "1"). }
+procedure RegisterTexturePackEntry(AppDir: String);
+var
+  SizeKB: Int64;
+begin
+  AppDir := RemoveBackslashUnlessRoot(AppDir);
+  if AppDir = '' then Exit;
+  RemoveLegacyPackEntry(HKCU, AppDir);
+  RemoveLegacyPackEntry(HKLM, AppDir);
+  if not RegWriteStringValue(HKCU, TexturePackKey, 'DisplayName', 'NHL Hitz Pro Hi-Res Textures') then begin
+    Log('Could not register the hi-res texture pack in Programs and Features.');
+    Exit;
+  end;
+  RegWriteStringValue(HKCU, TexturePackKey, 'DisplayVersion', '{#TextureDisplayVersion}');
+  RegWriteStringValue(HKCU, TexturePackKey, 'Publisher', 'dalves408/nhlhitzpro-recomp');
+  RegWriteStringValue(HKCU, TexturePackKey, 'URLInfoAbout', 'https://github.com/dalves408/nhlhitzpro-recomp');
+  RegWriteStringValue(HKCU, TexturePackKey, 'InstallLocation', AddBackslash(AppDir));
+  RegWriteStringValue(HKCU, TexturePackKey, 'Inno Setup: App Path', AppDir);
+  RegWriteDWordValue(HKCU, TexturePackKey, 'NoModify', 1);
+  RegWriteDWordValue(HKCU, TexturePackKey, 'NoRepair', 1);
+  SizeKB := {#TextureExtractedBytes} div 1024;
+  if SizeKB > $FFFFFFFF then SizeKB := $FFFFFFFF;
+  RegWriteDWordValue(HKCU, TexturePackKey, 'EstimatedSize', SizeKB);
+  Log('Registered hi-res textures as {#TextureDisplayVersion} in Programs and Features.');
 end;
 
 function TextureKnownPack(AppDir, PackDir: String): Boolean;
@@ -425,8 +458,7 @@ begin
           if not DelTree(Backup, True, True, True) then Log('Old texture backup remains at ' + Backup);
         end else Log('Previous texture folder preserved at ' + Backup);
       end;
-      RemoveLegacyPackEntry(HKCU, AppDir);
-      RemoveLegacyPackEntry(HKLM, AppDir);
+      RegisterTexturePackEntry(AppDir);
       Log('Revision 2 texture pack extraction completed.');
     except
       if TextureTransferCancelled then

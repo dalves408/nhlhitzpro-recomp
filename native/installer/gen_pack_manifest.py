@@ -11,7 +11,7 @@ release?) and then checks every listed file's size and SHA-256 (is it intact?).
 """
 import hashlib, os, sys
 
-PACK_VERSION = '1'
+PACK_VERSION = '2'
 
 
 def sha256(path):
