@@ -33,7 +33,7 @@ __HITZ_LINUX_ARCHIVE__
 '''
 
 PLAY = '''#!/bin/sh
-set -eu
+set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 GAME_ROOT=${HITZ_GAME_ROOT:-$ROOT}
 case ${XDG_DATA_HOME:-} in
@@ -43,13 +43,45 @@ esac
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}/nhlhitzpro"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/nhlhitzpro"
 mkdir -p "$DATA/logs" "$CACHE"
+LOG="$DATA/logs/play.log"
+# keep the last run's log: a second try must not erase the first failure
+if [ -f "$LOG" ]; then mv -f "$LOG" "$DATA/logs/play.previous.log"; fi
+VERSION=$(cat "$ROOT/version.txt" 2>/dev/null || echo unknown)
+{
+    echo "=== NHL Hitz Pro $VERSION - play log ==="
+    echo "started    : $(date '+%Y-%m-%d %H:%M:%S %z')"
+    echo "system     : $(uname -srm)"
+    echo "distro     : $( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}" )"
+    echo "glibc      : $(ldd --version 2>/dev/null | head -n 1)"
+    echo "session    : XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-} DISPLAY=${DISPLAY:-} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-}"
+    echo "game root  : $GAME_ROOT"
+    echo "game files : $(ls "$GAME_ROOT/game_files/default.xbe" 2>&1)"
+    echo "---"
+} > "$LOG" 2>&1
 export RECOMP_GL_VERTEX_UPLOAD=stream RECOMP_GL_VERTEX_INDEXED=1
 export RECOMP_GL_TEXTURE_WATCH=1 RECOMP_GL_TEXTURE_WATCH_CLEAR_EVERY=8 RECOMP_GL_TEXTURE_WATCH_FAST=1
 export RECOMP_GL_TEXTURE_INDEX=1 RECOMP_PB_IDLE_WAIT_US=100
 export RECOMP_GL_SHADER_PREWARM="$CACHE/hitz_prewarm.txt"
 export RECOMP_TEXPACK="$GAME_ROOT/texture_pack"
-cd "$ROOT/native"
-exec ./build-linux/nhl_hitz_pro_recomp "$GAME_ROOT/game_files" "$@" > "$DATA/logs/play.log" 2>&1
+cd "$ROOT/native" || exit 1
+START=$(date +%s)
+./build-linux/nhl_hitz_pro_recomp "$GAME_ROOT/game_files" "$@" >> "$LOG" 2>&1
+STATUS=$?
+SECONDS_RUN=$(( $(date +%s) - START ))
+echo "--- exited with code $STATUS after $SECONDS_RUN s ---" >> "$LOG"
+if [ "$STATUS" -ne 0 ] || [ "$SECONDS_RUN" -lt 10 ]; then
+    {
+        echo "NHL Hitz Pro stopped (exit code $STATUS, after $SECONDS_RUN s)."
+        echo "The log is: $LOG"
+        echo "Please attach that file (and play.previous.log, if there is one) when reporting a problem."
+        echo "--- last lines of the log ---"
+        tail -n 15 "$LOG"
+    } >&2
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "NHL Hitz Pro stopped" "Exit code $STATUS. Log: $LOG" >/dev/null 2>&1 || true
+    fi
+fi
+exit "$STATUS"
 '''
 
 def package_appimage(root, output, version, tool, runtime, project):
@@ -105,7 +137,11 @@ def main():
     args = ap.parse_args()
     source, project, output = args.source.resolve(), args.project.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    version, commit = args.version, 'be8fcaa052a8731d34c5bcb7fcc192d4552972dc'
+    version = args.version
+    try:  # the commit the package is built from (the project checkout)
+        commit = subprocess.check_output(['git', '-C', str(project), 'rev-parse', 'HEAD'], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        commit = 'unknown'
     if not re.fullmatch(r'[0-9A-Za-z.-]+', version):
         ap.error('Invalid version label')
     if bool(args.appimagetool) != bool(args.appimage_runtime):
@@ -202,6 +238,7 @@ else: gui(b)
         shutil.copyfile(project / 'native/installer/linux/menu_shortcuts.py', player / 'menu_shortcuts.py')
         (player / 'install-shortcuts.py').write_text('#!/usr/bin/env python3\nfrom menu_shortcuts import main\nmain()\n')
         (player / 'play.sh').write_text(PLAY)
+        (player / 'version.txt').write_text(version + '\n')
         (player / 'settings.sh').write_text('#!/bin/sh\nROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec python3 "$ROOT/nhl_config.py"\n')
         for name in ('play.sh', 'settings.sh', 'uninstall.py', 'install-shortcuts.py'):
             (player / name).chmod(0o755)
@@ -233,7 +270,9 @@ Hi-res DDS formats may require additional GPU capabilities.
 Debian 13 / Ubuntu 24.04+: sudo apt install libsdl2-2.0-0 libepoxy0 libpng16-16t64 python3-tk 7zip innoextract
 Fedora 41+: sudo dnf install SDL2 libepoxy libpng python3-tkinter 7zip innoextract
 Settings/saves: $XDG_DATA_HOME/nhlhitzpro or ~/.local/share/nhlhitzpro.
-Play log: that folder's logs/play.log. Shader prewarm: ~/.cache/nhlhitzpro.
+Play log: logs/play.log in that folder (the previous run is kept as play.previous.log).
+If the game stops or does not start, run play.sh from a terminal: it prints the log path and the
+last lines of the log. Attach play.log when reporting a problem. Shader prewarm: ~/.cache/nhlhitzpro.
 Default fresh settings: 1x, fullscreen, 4:3, 60 FPS, enhancements off.
 Enable hi-res in settings.sh or F1 with render scale 2x or greater.
 python3 uninstall.py removes unchanged program files/shortcuts, keeping game data,

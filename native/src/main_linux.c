@@ -119,6 +119,10 @@ int main(int argc, char **argv)
     if (SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_GAMECONTROLLER)) {
         fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); free(bytes); return 1;
     }
+    {   SDL_version linked; SDL_GetVersion(&linked);
+        fprintf(stderr,"[BOOT] SDL %u.%u.%u, video driver: %s, audio driver: %s\n",linked.major,linked.minor,linked.patch,
+                SDL_GetCurrentVideoDriver()?SDL_GetCurrentVideoDriver():"none",SDL_GetCurrentAudioDriver()?SDL_GetCurrentAudioDriver():"none");
+    }
     xbox_InputInit();
     backend_gl_register();
     if (!xbox_MemoryLayoutInit(bytes,(size_t)size)) {
@@ -137,5 +141,6 @@ int main(int argc, char **argv)
     xbe_entry_point();
     hitz_linux_performance_shutdown(); hitz_gl_pack_shutdown();
     xbox_kernel_shutdown(); xbox_MemoryLayoutShutdown(); free(bytes); SDL_Quit();
+    fprintf(stderr,"[BOOT] the game ended normally\n");
     return 0;
 }

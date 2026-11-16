@@ -52,6 +52,8 @@ XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to 
 
 **Linux:** version 1.0.9 also has a first Linux release (x86-64, OpenGL): a Standalone AppImage with a Setup wizard, a settings app, disc import and the Revision 2 texture install (`chmod +x` it, then run it; `--setup` and `--settings` open those). There is also a tar.gz for RecompLauncher. See `native/installer/linux/README.md`.
 
+The Linux game writes a log of every run to `~/.local/share/nhlhitzpro/logs/play.log` (or under `$XDG_DATA_HOME`); the run before it is kept as `play.previous.log`. If the game stops or does not start, run it from a terminal: it prints the log path and the last lines of the log. Please attach `play.log` when reporting a problem.
+
 **Known issues**
 
 - The first time through a new part of the game, a short stutter can appear while shaders are built. It does not return once they are cached.

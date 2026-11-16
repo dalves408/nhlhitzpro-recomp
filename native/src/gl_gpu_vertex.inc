@@ -101,6 +101,10 @@ static char *read_shader_file(const char *name)
             *slash = 0;
             if (snprintf(path, sizeof(path), "%s/shaders/%s", executable, name) < (int)sizeof(path))
                 f = fopen(path, "rb");
+            /* installed and dev trees: <native>/build-linux/<player> next to <native>/src/shaders,
+               whatever the working directory and whatever path the build was configured with */
+            if (!f && snprintf(path, sizeof(path), "%s/../src/shaders/%s", executable, name) < (int)sizeof(path))
+                f = fopen(path, "rb");
         }
     }
     if (!f) {
@@ -108,7 +112,7 @@ static char *read_shader_file(const char *name)
             return NULL;
         f = fopen(path, "rb");
     }
-    if (!f) return NULL;
+    if (!f) { fprintf(stderr, "[GL] cannot read shader file %s (last tried %s)\n", name, path); return NULL; }
     if(fseek(f,0,SEEK_END)){fclose(f);return NULL;}
     long n=ftell(f);
     if(n<0||fseek(f,0,SEEK_SET)){fclose(f);return NULL;}

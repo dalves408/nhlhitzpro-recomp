@@ -40,6 +40,7 @@ Without `--appimagetool` / `--appimage-runtime`, the builder falls back to a `.r
 - XDG data/cache: `nhlhitzpro`
 - Default install: `~/Games/NHL Hitz Pro`
 - Icon: `native/resources/nhl_hitz_pro.png` (from Pro `.ico`) → packaged `icon.png`
+- Log: `play.sh` writes `~/.local/share/nhlhitzpro/logs/play.log` (header with version, distro, glibc, session type and game files, then the game's output and the exit code); the previous run is kept as `play.previous.log`. A run that fails or ends within 10 s prints the log path and its last 15 lines on the terminal (and a `notify-send` message when available).
 - Settings app: `linux/nhl_config.py` (Video / Controls / Textures), desktop shortcut beside the game
 
 ## Texture pack (Pro-specific)
