@@ -62,27 +62,40 @@ def refresh_menu(applications):
     return results
 
 
-def install_shortcuts(game_dir, replace=False):
+def install_shortcuts(game_dir, replace=False, program=None, icon=None):
+    """Menu entries for the game and its settings. With `program` (the AppImage) the entries run it directly
+    (`--play` / `--settings`) and `icon` is copied to the user's icon folder; otherwise they run the play.sh and
+    settings.sh of a .run install."""
     require_desktop_user()
     game = Path(game_dir).expanduser().resolve(strict=True)
     if any(char in str(game) for char in '\n\r\t'):
         raise ValueError('Choose a game directory without newline or tab characters.')
-    for name in ('play.sh', 'settings.sh', 'icon.png'):
-        if not (game / name).is_file():
-            raise ValueError('Choose the installed game folder containing play.sh, settings.sh and icon.png. Missing: ' + name)
     apps = data_home() / 'applications'
+    if program:
+        program = Path(program).resolve(strict=True)
+        icons = data_home() / 'icons'
+        icons.mkdir(parents=True, exist_ok=True)
+        icon_path = icons / 'nhl-hitz-pro.png'
+        shutil.copyfile(icon, icon_path)
+        run = lambda option: f'Exec={exec_argument(program)} {option} --data-dir {exec_argument(game)}\n'
+        commands = [run('--play'), run('--settings')]
+    else:
+        for name in ('play.sh', 'settings.sh', 'icon.png'):
+            if not (game / name).is_file():
+                raise ValueError('Choose the installed game folder containing play.sh, settings.sh and icon.png. Missing: ' + name)
+        icon_path = game / 'icon.png'
+        commands = [f'Exec=/bin/sh {exec_argument(game / script)}\nTryExec=/bin/sh\n' for script in ('play.sh', 'settings.sh')]
     apps.mkdir(parents=True, exist_ok=True)
-    entries = [(apps / 'nhl-hitz-pro.desktop', 'NHL Hitz Pro', 'play.sh', 'Play NHL Hitz Pro'),
-               (apps / 'nhl-hitz-pro-settings.desktop', 'NHL Hitz Pro Settings', 'settings.sh',
+    entries = [(apps / 'nhl-hitz-pro.desktop', 'NHL Hitz Pro', commands[0], 'Play NHL Hitz Pro'),
+               (apps / 'nhl-hitz-pro-settings.desktop', 'NHL Hitz Pro Settings', commands[1],
                 'Configure NHL Hitz Pro')]
     if not replace and any(path.exists() or path.is_symlink() for path, *_ in entries):
-        raise ValueError('Game menu entries already exist. Use the installed install-shortcuts.py repair tool, or disable shortcuts during Setup.')
+        raise ValueError('Game menu entries already exist. Run Setup again to repair them, or disable shortcuts during Setup.')
     hashes, backups = {}, []
-    for path, title, script, description in entries:
+    for path, title, command, description in entries:
         content = ('[Desktop Entry]\nVersion=1.0\nType=Application\n' +
-                   f'Name={title}\nComment={description}\n' +
-                   f'Exec=/bin/sh {exec_argument(game / script)}\nTryExec=/bin/sh\n' +
-                   f'Path={value_escape(game)}\nIcon={value_escape(game / "icon.png")}\n' +
+                   f'Name={title}\nComment={description}\n' + command +
+                   f'Path={value_escape(game)}\nIcon={value_escape(icon_path)}\n' +
                    'Terminal=false\nStartupNotify=false\nCategories=Game;SportsGame;\n')
         if path.is_symlink():
             raise ValueError('Refusing to overwrite a symbolic-link menu entry: ' + str(path))

@@ -199,11 +199,12 @@ static void keymap_load(void)
     };
     int got[NHL_KEYMAP_COUNT][2];
     char path[4096], line[256], section[64] = "";
-    const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME"), *portable = getenv("NHLHITZPRO_DATA");
     FILE *f;
     int i;
 
-    if (xdg && *xdg) snprintf(path, sizeof path, "%s/nhlhitz2003/keymap.ini", xdg);
+    if (portable && *portable) snprintf(path, sizeof path, "%s/keymap.ini", portable);   /* <install folder>/data, set by play.sh */
+    else if (xdg && *xdg) snprintf(path, sizeof path, "%s/nhlhitz2003/keymap.ini", xdg);
     else if (home && *home) snprintf(path, sizeof path, "%s/.local/share/nhlhitz2003/keymap.ini", home);
     else return;
     if (!(f = fopen(path, "r")))

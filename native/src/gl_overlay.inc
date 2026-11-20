@@ -26,8 +26,9 @@ static int s_stretch,s_vsync,s_fpsi=1,s_hires,s_hires_boot,s_scale_cfg=1;
 
 static int ov_cfg_path(char *o,size_t n)
 {
-    const char *x=getenv("XDG_DATA_HOME"),*h=getenv("HOME");char d[3500];
-    if(x&&*x)snprintf(d,sizeof d,"%s/nhlhitzpro",x);else if(h&&*h)snprintf(d,sizeof d,"%s/.local/share/nhlhitzpro",h);else return 0;
+    const char *x=getenv("XDG_DATA_HOME"),*h=getenv("HOME"),*p=getenv("NHLHITZPRO_DATA");char d[3500];
+    if(p&&*p)snprintf(d,sizeof d,"%s",p);   /* the portable data folder (play.sh) */
+    else if(x&&*x)snprintf(d,sizeof d,"%s/nhlhitzpro",x);else if(h&&*h)snprintf(d,sizeof d,"%s/.local/share/nhlhitzpro",h);else return 0;
     mkdir(d,0755);snprintf(o,n,"%s/settings.ini",d);return 1;
 }
 static int cfg_get_s(const char *sec,const char *key,int def)
@@ -68,7 +69,11 @@ static void ov_settings_load(void)
     int present_env=getenv("RECOMP_PRESENT_HZ")!=NULL;
     env_default("RECOMP_RENDER_SCALE",cfg_get("resolution_scale",1));
     env_default("RECOMP_GL_FULLSCREEN",cfg_get("fullscreen",0)!=0);
-    env_default("RECOMP_GL_VSYNC",cfg_get("vsync",0)!=0);
+    {   /* A new install (no settings.ini yet) starts with VSync on, as on Windows: an existing file is left alone. */
+        char sp[4096];
+        if(ov_cfg_path(sp,sizeof sp)&&access(sp,F_OK)!=0)cfg_put("vsync",1);
+    }
+    env_default("RECOMP_GL_VSYNC",cfg_get("vsync",1)!=0);   /* on unless the player turned it off */
     env_default("RECOMP_ANISOTROPY",cfg_get("anisotropy",1));
     env_default("RECOMP_GL_MSAA",cfg_get("msaa",1));
     {int hz=cfg_get("frame_rate",60);s_fpsi=fps_index(hz);
@@ -308,7 +313,7 @@ static void ov_action(int a)
 /* 1 = the event belongs to the overlay (the game does not see it) */
 static int ov_event(const SDL_Event *e)
 {
-    if(e->type==SDL_KEYDOWN){SDL_Keycode k=e->key.keysym.sym;
+    if(e->type==SDL_KEYDOWN){SDL_Keycode k=HITZ_KEYSYM(*e);
         if(!ov_mode){if(e->key.repeat)return 0;if(k==SDLK_ESCAPE){ov_open(1);return 1;}if(k==SDLK_F1){ov_open(2);return 1;}return 0;}
         if(k==SDLK_ESCAPE){if(ov_mode==2)ov_settings_close();else ov_close();return 1;}
         if(k==SDLK_F1){if(ov_mode==2)ov_settings_close();else if(ov_mode==3)ov_close();else ov_open(2);return 1;}
@@ -318,8 +323,17 @@ static int ov_event(const SDL_Event *e)
         return 1;
     }
     if(e->type==SDL_KEYUP)return ov_mode!=0;
+    /* Pad shortcut for F1: hold Back, press Start. The pad driver hides that Start from the game. */
+    {static int pad_back=0;
+     if(e->type==SDL_CONTROLLERBUTTONUP&&HITZ_PADBUTTON(*e)==SDL_CONTROLLER_BUTTON_BACK){pad_back=0;return 0;}
+     if(e->type==SDL_CONTROLLERBUTTONDOWN){
+        if(HITZ_PADBUTTON(*e)==SDL_CONTROLLER_BUTTON_BACK){pad_back=1;return 0;}
+        if(HITZ_PADBUTTON(*e)==SDL_CONTROLLER_BUTTON_START&&pad_back){
+            if(ov_mode==2)ov_settings_close();else if(ov_mode==3)ov_close();else ov_open(2);
+            return 1;}
+     }}
     if(ov_mode&&e->type==SDL_CONTROLLERBUTTONDOWN){
-        switch(e->cbutton.button){case SDL_CONTROLLER_BUTTON_DPAD_UP:ov_action(OV_UP);break;case SDL_CONTROLLER_BUTTON_DPAD_DOWN:ov_action(OV_DOWN);break;
+        switch(HITZ_PADBUTTON(*e)){case SDL_CONTROLLER_BUTTON_DPAD_UP:ov_action(OV_UP);break;case SDL_CONTROLLER_BUTTON_DPAD_DOWN:ov_action(OV_DOWN);break;
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT:ov_action(OV_LEFT);break;case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:ov_action(OV_RIGHT);break;
         case SDL_CONTROLLER_BUTTON_A:ov_action(OV_OK);break;case SDL_CONTROLLER_BUTTON_B:case SDL_CONTROLLER_BUTTON_START:ov_action(OV_BACK);break;}
         return 0;   /* the pad driver still tracks its state; the game sees neutral pads */

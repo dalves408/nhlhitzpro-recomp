@@ -440,6 +440,11 @@ static unsigned s_pad_mask;
 static int s_hotplug;
 extern void usb_gamepad_unplug(int pad);
 extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+#ifdef NHL_SDL3
+/* overrides/xinput_device.c: 1 when a pad (XInput or SDL3) is connected on this port. A PlayStation or Switch pad is
+ * not an XInput device, so asking XInput alone would never plug in player 2 for one. */
+extern int hitz_PadConnected(DWORD port);
+#endif
 
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
@@ -679,7 +684,26 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 if (s_trace)
                     fprintf(stderr, "  [OHCI%d] rumble pad %d left %u right %u (ep %u)\n",
                             hc->index, pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint);
-                xbox_InputSetState((DWORD)pad, &v);
+                {
+                    /* RECOMP_RUMBLE_LOG=1 (always on in the debug build): one
+                     * line per guest rumble report with the host pad's answer
+                     * (0 = sent, 1167 = no pad on that port). */
+                    static int rl = -1, rn;
+                    DWORD rc;
+                    if (rl < 0) {
+#ifdef NHL_DEBUGLOG
+                        rl = 1;
+#else
+                        const char *e = getenv("RECOMP_RUMBLE_LOG"); rl = e && *e == '1';
+#endif
+                    }
+                    rc = xbox_InputSetState((DWORD)pad, &v);
+                    if (rl && rn < 2000) {
+                        rn++;
+                        fprintf(stderr, "[RUMBLE] guest report pad %d left %u right %u ep %u -> host rc %lu\n",
+                                pad, v.wLeftMotorSpeed, v.wRightMotorSpeed, endpoint, (unsigned long)rc);
+                    }
+                }
             }
         }
         if (endpoint == 0) {
@@ -1150,7 +1174,11 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 last_poll = tnow;
                 want = 1u;
                 for (p = 1; p < 4u; p++)
+#ifdef NHL_SDL3
+                    if (hitz_PadConnected((DWORD)p))
+#else
                     if (XInputGetState((DWORD)p, st) == 0)
+#endif
                         want |= 1u << p;
                 if (test && atoi(test) > 0 && ((tnow / (DWORD)atoi(test)) & 1u))
                     want |= 2u;

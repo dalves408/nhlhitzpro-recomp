@@ -17,14 +17,25 @@ from menu_shortcuts import data_home, xdg_home, install_shortcuts, require_deskt
 ROOT = Path(__file__).resolve().parent
 
 
-def ensure_settings():
-    """Create the fresh-install defaults without replacing an existing file."""
-    user_data = data_home() / 'nhlhitzpro'
+def data_folder(destination):
+    """The portable data folder: saves, settings, logs and the download cache live in <install folder>/data."""
+    return Path(destination) / 'data'
+
+
+def ensure_settings(destination, data=None):
+    """Create the fresh-install defaults without replacing an existing file. `data` overrides the data folder
+    (a RecompLauncher install keeps it beside the AppImage; see appimage.launcher_data_folder)."""
+    user_data = Path(data) if data else data_folder(destination)
     user_data.mkdir(parents=True, exist_ok=True)
+    # Settings from an older version are still in ~/.local/share/nhlhitzpro; play.sh moves them here on the first
+    # start, so a fresh default must not be written first (it would look newer and win).
+    old = data_home() / 'nhlhitzpro' / 'settings.ini'
+    if old.is_file() and not (user_data / '.moved-from-old-folder').exists():
+        return
     try:
         with (user_data / 'settings.ini').open('x') as output:
             output.write(
-                '[display]\nresolution_scale=1\nfullscreen=1\nstretch=0\nvsync=0\n'
+                '[display]\nresolution_scale=1\nfullscreen=1\nstretch=0\nvsync=1\n'
                 'frame_rate=60\nmsaa=1\nanisotropy=1\n\n'
                 '[textures]\nenabled=0\nrink=1\nlogos=1\njerseys=1\nglow=1\nother=1\n')
     except FileExistsError:
@@ -109,7 +120,8 @@ class ProductionBackend:
         self.metadata = json.loads((ROOT / 'release.json').read_text())
         self.version = self.metadata['version']
         self.pack = self.metadata['texture']
-        # Per-part caches: ~/.cache/nhlhitzpro/downloads/<part-sha256>/<filename>
+        # Per-part download caches: <install folder>/data/Downloads/<part-sha256>/<filename> (set once the
+        # install folder is known; until then the old shared cache is only used to count what is already there)
         self.cache_root = xdg_home('XDG_CACHE_HOME', '.cache') / 'nhlhitzpro/downloads'
         self.downloaded = []
         self.delete_on_exit = []
@@ -165,11 +177,39 @@ class ProductionBackend:
         except OSError:
             return False
 
+    # Folder entries Setup itself puts there (or that come with the game): a folder holding only these is
+    # treated as empty.
+    OWN_NAMES = {'data', 'game_files', 'texture_pack', 'texture-01.bin', 'texture-02.bin', '.hitz-linux-install.json',
+                 'recomplauncher.json'}
+
+    @classmethod
+    def own_entry(cls, name):
+        return name in cls.OWN_NAMES or name.endswith('.AppImage') or name.startswith('.hitz-setup-')
+
+    image_folder = None     # the AppImage's own folder (AppImageBackend): always allowed
+
+    def usable_as_is(self, dest):
+        """True when `dest` can be installed into directly: it does not exist yet, is the AppImage's own folder,
+        is an existing installation, or holds nothing but Setup's own files."""
+        dest = Path(dest)
+        if not dest.exists():
+            return True
+        if not dest.is_dir():
+            return False
+        if self.image_folder and dest.resolve() == Path(self.image_folder).resolve():
+            return True
+        if self.installed_game(dest) or (dest / 'texture_pack').is_dir() or (dest / '.hitz-linux-install.json').is_file():
+            return True
+        return all(self.own_entry(entry.name) for entry in dest.iterdir())
+
     def check_destination(self, dest):
-        if dest.exists() and (not dest.is_dir() or (any(dest.iterdir()) and not
-                (self.installed_game(dest) or (dest / 'texture_pack').is_dir()
-                 or (dest / '.hitz-linux-install.json').is_file()))):
-            raise ValueError('Choose an empty folder or an existing NHL Hitz Pro folder.')
+        if dest.exists() and not dest.is_dir():
+            raise ValueError('That is a file, not a folder. Choose a folder for the game.')
+        if not self.usable_as_is(dest):
+            others = sorted(entry.name for entry in Path(dest).iterdir() if not self.own_entry(entry.name))
+            raise ValueError('This folder already holds other files (' + ', '.join(others[:4]) +
+                             (', …' if len(others) > 4 else '') + ').\n\nChoose an empty folder, the folder this '
+                             'AppImage is in, or an existing NHL Hitz Pro folder.')
 
     def _verify_part(self, path, part, report, pct_lo=38, pct_hi=43):
         if path.stat().st_size != part['bytes']:
@@ -340,8 +380,31 @@ class ProductionBackend:
             return
         raise ValueError('No usable texture payload was resolved.')
 
-    def stage_program(self, stage):
+    def stage_program(self, stage, dest):
         shutil.copytree(ROOT / 'player', stage, dirs_exist_ok=True)
+
+    def make_shortcuts(self, dest):
+        return install_shortcuts(dest, replace=True)
+
+    @staticmethod
+    def remove_old_program_files(dest, old_files, new_files):
+        """Program files an earlier Setup installed (play.sh, settings.sh, install-info.json...) that this one no
+        longer installs. Only files still exactly as installed go; game data, saves and anything the player
+        changed stay."""
+        for rel, expected in old_files.items():
+            if rel in new_files or rel.startswith(('game_files/', 'texture_pack/', 'data/')):
+                continue
+            path = dest / rel
+            try:
+                if path.is_file() and not path.is_symlink() and path.resolve().is_relative_to(dest) \
+                        and digest(path) == expected:
+                    path.unlink()
+                    parent = path.parent
+                    while parent != dest and not any(parent.iterdir()):
+                        parent.rmdir()
+                        parent = parent.parent
+            except (OSError, ValueError):
+                continue
 
     def install(self, destination, textures, shortcut, report, source, *, install_program=True):
         self.stop.clear()
@@ -358,6 +421,7 @@ class ProductionBackend:
                 + check.stderr[-1600:])
         dest = Path(destination).expanduser().resolve()
         self.check_destination(dest)
+        self.cache_root = data_folder(dest) / 'Downloads'     # the download cache is part of the install folder
         existing_game = self.installed_game(dest)
         reuse_game = False
         if existing_game:
@@ -404,12 +468,13 @@ class ProductionBackend:
                     raise ValueError(
                         'There is not enough free space in the texture download cache: '
                         + str(self.cache_root))
-        if shutil.disk_usage(dest.parent).free < required:
+        work_parent = dest if dest.is_dir() else dest.parent
+        if shutil.disk_usage(work_parent).free < required:
             raise ValueError(f'At least {required / 1e9:.2f} GB of free installation space is needed.')
         record_path = dest / '.hitz-linux-install.json'
         old_record = (json.loads(record_path.read_text()) if install_program and
                       record_path.is_file() and not record_path.is_symlink() else {})
-        with tempfile.TemporaryDirectory(prefix='.hitz-setup-', dir=dest.parent) as temp:
+        with tempfile.TemporaryDirectory(prefix='.hitz-setup-', dir=work_parent) as temp:
             stage = Path(temp) / 'install'
             stage.mkdir()
             report(5, 'Verifying your game source…')
@@ -428,7 +493,7 @@ class ProductionBackend:
                          copy_progress=importing, cancelled=self.cancelled)
             if install_program:
                 report(36, 'Installing the Linux game and settings application…')
-                self.stage_program(stage)
+                self.stage_program(stage, dest)
             if reuse_textures:
                 report(70, 'Keeping the installed texture pack (matches Revision %s).'
                        % self.pack.get('revision', '?'))
@@ -462,14 +527,16 @@ class ProductionBackend:
                     if p.is_file() and not p.relative_to(stage).as_posix().startswith(
                         ('game_files/', 'texture_pack/'))
                 }
-                (stage / 'install-info.json').write_text(json.dumps(self.metadata, indent=2))
-                owned['install-info.json'] = digest(stage / 'install-info.json')
-                record = {'files': owned, 'shortcuts': old_record.get('shortcuts', {})}
+                record = {'files': owned, 'release': self.metadata, 'shortcuts': old_record.get('shortcuts', {})}
                 (stage / record_path.name).write_text(json.dumps(record, indent=2))
             publish(stage, dest)
+        if install_program:
+            self.remove_old_program_files(dest, old_record.get('files', {}), owned)
+        else:
+            record = {}
         if shortcut:
             report(95, 'Creating application-menu shortcuts…')
-            menu = install_shortcuts(dest, replace=True)
+            menu = self.make_shortcuts(dest)
             record['shortcuts'] = menu['shortcuts']
             record['menu_refresh'] = menu['refresh']
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=dest, delete=False) as stream:
@@ -479,7 +546,7 @@ class ProductionBackend:
                 updated_record.replace(record_path)
             finally:
                 updated_record.unlink(missing_ok=True)
-        ensure_settings()
+        ensure_settings(dest, os.environ.get('NHLHITZPRO_DATA'))   # the AppImage may keep data beside itself
         report(100, 'Installation complete.')
         return dest
 
@@ -487,11 +554,12 @@ class ProductionBackend:
         if self.downloaded:
             from tkinter import messagebox
             listing = '\n'.join(str(path) for path in self.downloaded)
-            keep = messagebox.askyesno(
-                'Keep texture downloads?',
-                'Keep the downloaded texture parts for future repairs or reinstalls?\n\n' + listing,
-                parent=parent)
-            if not keep:
+            delete = messagebox.askyesno(
+                'Delete texture downloads?',
+                'The hi-res texture pack is installed, so the downloaded parts are no longer needed.\n\n'
+                'Delete them now? Choose No to keep them for future repairs or reinstalls.\n\n' + listing,
+                default='yes', parent=parent)
+            if delete:
                 self.delete_on_exit = list(self.downloaded)
             self.downloaded = []
 
@@ -499,6 +567,7 @@ class ProductionBackend:
         for path in self.delete_on_exit:
             try:
                 path.unlink(missing_ok=True)
+                path.parent.rmdir()          # the per-part cache folder, if it is now empty
             except OSError:
                 pass
         self.delete_on_exit = []

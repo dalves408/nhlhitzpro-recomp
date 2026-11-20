@@ -4,7 +4,7 @@ A normal release has no log and no diagnostics. When a player hits a bug that ne
 debug flavour: the same game code plus self-monitoring (`src/debug_report.c`). It is never part of a release.
 
 ## What it records (all inside the game, nothing to install on the PC)
-Files go to `%LOCALAPPDATA%\NHLHitzPro\debug`:
+Files go to `<install folder>\data\debug` (portable layout):
 - `session_<date>.log` (and `.log.1`): everything the game prints, a header (build tag, OS, CPU, RAM, displays, settings),
   a heartbeat every 5 s (frames, memory, handles), every controller change (`[PADLOG]`), key presses (`[KEYLOG]`), audio
   voice stats (`[APU-VSTAT]`), first-chance exceptions (`[EXC]`) and the reason for every exit (`[EXIT]`). Last 6 sessions kept,

@@ -99,6 +99,30 @@ list(REMOVE_ITEM input_sources keyboard.c)
 set_property(TARGET xbox_input PROPERTY SOURCES "${input_sources}")
 target_sources(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/keyboard.c")
 target_include_directories(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides")
+# SDL3 controllers on Windows (on by default for the 64-bit build): every pad (Xbox, PlayStation, Switch,
+# generic) comes from SDL3 and rumbles through it; the 32-bit builds keep the toolkit XInput code. Needs the SDL3 development package; SDL3.dll ships beside the exe.
+# On by default for the 64-bit Windows build, from the copy in third_party; the 32-bit (x86, XP) builds do without it.
+set(NHL_SDL3_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3-3.4.20" CACHE PATH "SDL3 development package: include/SDL3, lib/x64/SDL3.lib, lib/x64/SDL3.dll")
+set(_nhl_sdl3_default OFF)
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND EXISTS "${NHL_SDL3_ROOT}/lib/x64/SDL3.lib")
+    set(_nhl_sdl3_default ON)
+endif()
+option(NHL_SDL3 "Windows: all controllers through SDL3 (no XInput)" ${_nhl_sdl3_default})
+if(NHL_SDL3)
+    if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR "NHL_SDL3 is for the 64-bit Windows player build")
+    endif()
+    if(NOT EXISTS "${NHL_SDL3_ROOT}/include/SDL3/SDL.h" OR NOT EXISTS "${NHL_SDL3_ROOT}/lib/x64/SDL3.lib")
+        message(FATAL_ERROR "NHL_SDL3_ROOT must name an SDL3 development package (include/SDL3/SDL.h, lib/x64/SDL3.lib)")
+    endif()
+    get_target_property(input_sources2 xbox_input SOURCES)
+    list(REMOVE_ITEM input_sources2 xinput_device.c)
+    set_property(TARGET xbox_input PROPERTY SOURCES "${input_sources2}")
+    target_sources(xbox_input PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/overrides/xinput_device.c")
+    target_include_directories(xbox_input PRIVATE "${NHL_SDL3_ROOT}/include")
+    target_link_libraries(xbox_input PUBLIC "${NHL_SDL3_ROOT}/lib/x64/SDL3.lib")
+    target_compile_definitions(xbox_usb PRIVATE NHL_SDL3=1)   # the USB layer asks the input layer which players are connected
+endif()
 # Project-local copy of host_time.c: a pausable host clock and a timer thread that holds while paused.
 get_target_property(host_time_sources host_time SOURCES)
 list(REMOVE_ITEM host_time_sources host_time.c)
@@ -179,6 +203,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
 # Include paths for generated recomp headers
 target_include_directories(${PROJECT_NAME} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/overrides"
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
@@ -201,6 +226,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dbghelp
 )
 
+if(NHL_SDL3)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_SDL3=1)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${NHL_SDL3_ROOT}/lib/x64/SDL3.dll" "$<TARGET_FILE_DIR:${PROJECT_NAME}>")
+endif()
 if(NHL_RELEASE)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_RELEASE=1)
     # kernel_thunks.c override: no xbox_kernel.log file (the stock one opens it in the cwd).
@@ -220,6 +250,7 @@ endif()
 if(NHL_DEBUGLOG)
     target_compile_definitions(${PROJECT_NAME} PRIVATE NHL_DEBUGLOG=1)
     target_compile_definitions(xbox_kernel PRIVATE NHL_DEBUGLOG=1)
+    target_compile_definitions(xbox_usb PRIVATE NHL_DEBUGLOG=1)
     target_link_libraries(${PROJECT_NAME} PRIVATE psapi shell32)
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/nhl_debug_tag.h" "#define NHL_DEBUG_TAG \"${NHL_DEBUG_TAG}\"
 ")

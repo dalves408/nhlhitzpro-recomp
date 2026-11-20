@@ -4,6 +4,8 @@ A native Windows (and Linux) build of **NHL Hitz Pro** (original Xbox, 2003, USA
 
 This project contains **no game content**. You need your own copy of the Xbox disc.
 
+<a href="https://recomplauncher.com/game/nhlhitzpro-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" alt="Get it on RecompLauncher" height="48"></picture></a>
+
 ## Playing
 
 **Requirements**
@@ -17,18 +19,18 @@ This project contains **no game content**. You need your own copy of the Xbox di
 
 **Install**
 
-1. Run `NHLHitzPro-Setup-1.0.9.exe` and choose where to install. A fresh install suggests `C:\Games\NHL Hitz Pro`; if the game is already installed, its folder is suggested instead. You can change the folder either way.
+1. Run `NHLHitzPro-Setup-1.1.0.exe` and choose where to install. A fresh install suggests `C:\Games\NHL Hitz Pro`; if the game is already installed, its folder is suggested instead. You can change the folder either way.
 2. When asked, pick your disc image or folder. Setup checks that it is the supported version and copies the game files it needs (about 1.5 GB).
 3. Optionally tick the **hi-res texture pack** task to add the 4x texture pack (see below). It is off by default.
 4. Start **NHL Hitz Pro** from the Start menu.
 
 If the game is already installed, Setup says so and shows the installed version and the new one. A different version only updates the program files after you confirm (no disc needed, game files and saves kept); the same version offers Repair or Quit.
 
-Saves and the shader cache are kept in `%LOCALAPPDATA%\NHLHitzPro`. Uninstalling removes the game files but leaves your saves.
+**Portable:** everything is in the install folder. Saves, settings, the keymap, the shader cache and any debug logs are in its `data` folder, so you can copy, move or back up the game by copying the one folder. There is no uninstaller and nothing in Windows' Installed Apps: to remove the game, delete the folder (and the Start menu and desktop shortcuts, if you made them). The first time 1.1.0 starts, saves and settings that an older version kept in `%LOCALAPPDATA%\NHLHitzPro` are moved into `data` (the newer copy of a file wins; an older duplicate goes to `data\old-appdata-backup`). If the install folder cannot be written to (for example under Program Files), the game falls back to `%LOCALAPPDATA%\NHLHitzPro`.
 
 **Controls**
 
-| | Xbox controller | Keyboard |
+| | Controller | Keyboard |
 |---|---|---|
 | Start | Start | Enter |
 | A / B / X / Y | A / B / X / Y | Z / X / C / V |
@@ -38,9 +40,9 @@ Saves and the shader cache are kept in `%LOCALAPPDATA%\NHLHitzPro`. Uninstalling
 
 Esc pauses the game (clocks, timers and sound stop) and asks "Do you want to quit?"; choosing No resumes exactly where you left off. The game starts in borderless fullscreen and remembers the last mode you used.
 
-XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
+Controllers work without setup, up to four for the four-player game: they can be plugged in or removed while the game runs, and controller N is player N. Every controller (Xbox 360, Xbox One and Series, PlayStation DualShock 4 and DualSense, Nintendo Switch and most other pads) is read through SDL3 (`SDL3.dll` is installed beside the game); there is no separate XInput path any more. A pad keeps its player number while it stays plugged in, and a new pad takes the next free one. Rumble works on all of them. The keyboard is an extra input for player 1. The window keeps the game's 4:3 shape; in fullscreen it is centred with black bars.
 
-**Settings menu (F1, or hold Back and press Start on controller 1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), VSync, **Frame Rate** (30, 60, 120, 144, 240 or 360 fps; the intro movies always run at 60), anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
+**Settings menu (F1, or hold Back and press Start on controller 1):** pauses the game and lets you change the **Render Scale** (one multiplier for all of the game's drawing: 1x is the Xbox's native 640x480, up to 5x, 3200x2400), fullscreen, **Stretch image** (off keeps the game's 4:3 shape; on fills the window, stretched), **VSync** (on by default: it keeps a fast camera pan smooth; turn it off to measure frame rates), **Frame Rate** (30, 60, 120, 144, 240 or 360 fps; the intro movies always run at 60), anti-aliasing (2x, 4x or 8x MSAA) and anisotropic filtering. Use the keyboard (Up/Down, Left/Right, Enter, Esc) or controller 1 (D-pad or left stick, A to confirm, B or Start to close); the mouse and the other controllers do nothing while it is open. Changes are saved automatically in `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. Esc still opens the quit prompt.
 
 **Settings program:** run **NHL Hitz Pro Settings** (`config.exe`, in the install folder and the Start menu) to set things before you start the game. Its **Video** tab, shown first, has the same options as the F1 menu (render scale, fullscreen, stretch image, VSync, frame rate, anti-aliasing, anisotropic filter). Its **Controls** tab remaps the keyboard.
 
@@ -48,11 +50,11 @@ XInput controllers (Xbox 360, Xbox One, most PC pads) work without setup, up to 
 
 **Hi-res texture pack (optional, Revision 2):** 6,287 textures redrawn at 4x resolution as BC7 DDS files: the ice, boards and glass, team logos, jerseys and numbers, faces and more. It needs game version 1.0.9 or newer. It is a separate add-on on the [textures-2](https://github.com/dalves408/nhlhitzpro-recomp/releases/tag/textures-2) release: a small `NHLHitzPro-HiRes-Textures-2-Setup.exe` plus two data files, `texture-01.bin` (about 1 GB) and `texture-02.bin` (about 1.6 GB); it takes about 5 GB on disk once installed. The game installer's hi-res texture task installs it, or you can run the add-on on its own after the game is installed. For an offline install, put both `.bin` files in the same folder as Setup; otherwise Setup downloads any missing part (it resumes, and checks each part's size and SHA-256 before use). A Revision 1 pack is cleaned up after Revision 2 is installed. The pack lives in `<install folder>\texture_pack`; pictures placed in `%LOCALAPPDATA%\NHLHitzPro\texture_pack` override the same texture. A replacement picture is matched by the first 16 hex characters of its file name (a hash of the original texture's pixels) and can be a DDS (BC1, BC2, BC3, BC7 or uncompressed), PNG or BMP of any size. The settings program's **Textures** tab has a master switch and one checkbox per kind (greyed out with a download button when no pack is installed), and the F1 menu has a **Hi-res textures** line that turns the whole pack on or off while you play. The 4x pictures are only used at **Render Scale 2x or higher**; at 1x (native) the switch is dark and the original textures are shown.
 
-**RecompLauncher:** the release also has `NHLHitzPro-v1.0.9-Windows-x64.zip` for [RecompLauncher](https://recomplauncher.com) (Level 3): it picks your disc image, imports the game files (`nhl_import.exe --prepare`) and shows the video settings. When RecompLauncher starts the game in Big Picture mode, the game runs in borderless fullscreen; in desktop mode it uses your saved setting. The normal installer is for everyone else. See `native/RECOMPLAUNCHER.md`.
+**RecompLauncher:** the release also has `NHLHitzPro-v1.1.0-Windows-x64.zip` for [RecompLauncher](https://recomplauncher.com) (Level 3): it picks your disc image, imports the game files (`nhl_import.exe --prepare`) and shows the video settings. When RecompLauncher starts the game in Big Picture mode, the game runs in borderless fullscreen; in desktop mode it uses your saved setting. The normal installer is for everyone else. See `native/RECOMPLAUNCHER.md`.
 
-**Linux:** version 1.0.9 also has a first Linux release (x86-64, OpenGL): a Standalone AppImage with a Setup wizard, a settings app, disc import and the Revision 2 texture install (`chmod +x` it, then run it; `--setup` and `--settings` open those). There is also a tar.gz for RecompLauncher. See `native/installer/linux/README.md`.
+**Linux:** version 1.1.0 has a Linux release too (x86-64, OpenGL; same version number as Windows). It is one file, `NHLHitzPro-1.1.0-linux-Standalone.AppImage` (about 21 MB), and it runs on its own: it carries its own Python and Tk, 7-Zip, SDL3 and the libraries it needs, so nothing has to be installed from your distribution except the graphics driver (and FUSE, which every AppImage needs; without it start the file with `APPIMAGE_EXTRACT_AND_RUN=1`). Make it executable (`chmod +x`) and run it: a Setup window suggests `~/Games/NHL Hitz Pro`; type or browse to another folder, or press "Use this AppImage's folder", then pick your NHL Hitz Pro (USA) disc image or game folder and, if you want, the Revision 2 texture pack. The game goes into the folder you chose together with a copy of the AppImage, `texture_pack` and a `data` folder (saves, settings, logs), so that folder is the whole game; open the AppImage in it to play (an application-menu entry is optional). There are no launcher scripts. `--settings` opens the settings app and `--setup` opens Setup again. There is also a tar.gz (the AppImage and `recomplauncher.json`) for [RecompLauncher](https://recomplauncher.com). The Linux player uses SDL3, so Xbox, PlayStation, Switch and most other controllers work, can be plugged in while the game runs, and rumble. Hold Back (Share) and press Start (Options) opens the settings menu there too; the mouse pointer is hidden over the game. If Steam is running with Steam Input on, it can take a controller away from the game: turn Steam Input off for that controller, or close Steam.
 
-The Linux game writes a log of every run to `~/.local/share/nhlhitzpro/logs/play.log` (or under `$XDG_DATA_HOME`); the run before it is kept as `play.previous.log`. If the game stops or does not start, run it from a terminal: it prints the log path and the last lines of the log. Please attach `play.log` when reporting a problem.
+The Linux game is portable too: saves, settings and logs are in the `data` folder beside the AppImage (older files from `~/.local/share/nhlhitzpro` are moved there on the first start), and there is no uninstaller; delete the folder to remove the game. It writes a log of every run to `data/logs/play.log`; the run before it is kept as `play.previous.log`. If the game stops or does not start, run it from a terminal: it prints the log path and the last lines of the log. Please attach `play.log` when reporting a problem.
 
 **Known issues**
 
@@ -83,7 +85,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config RelWithDebInfo --parallel
 ```
 
-Run `native\build\RelWithDebInfo\nhl_hitz_pro_recomp.exe` from the `native` folder. For the player build (no logging, data in `%LOCALAPPDATA%`, static runtime):
+Run `native\build\RelWithDebInfo\nhl_hitz_pro_recomp.exe` from the `native` folder. For the player build (no logging, data in the install folder's `data` folder, static runtime):
 
 ```powershell
 cmake -S native -B native/build-release -DNHL_RELEASE=ON
@@ -94,7 +96,7 @@ The installer script is `native/installer/nhl_hitz_pro.iss` (Inno Setup); `scrip
 
 ## Debug builds and other branches
 
-A normal release writes no log. When a problem has to be tracked down on someone else's PC, a separate **debug build** of the same game is made: it logs to `%LOCALAPPDATA%\NHLHitzPro\debug`, writes a crash dump and zips it to the Desktop, and the player can press **DEL** to mark a graphical glitch (screenshots, a dump and the log are zipped when the game is closed). It is never part of a release; see `native/DEBUG-BUILD.md`.
+A normal release writes no log. When a problem has to be tracked down on someone else's PC, a separate **debug build** of the same game is made: it logs to the install folder's `data\debug`, writes a crash dump and zips it to the Desktop, and the player can press **DEL** to mark a graphical glitch (screenshots, a dump and the log are zipped when the game is closed). It is never part of a release; see `native/DEBUG-BUILD.md`.
 
 Work that is not part of the releases lives on its own branches:
 

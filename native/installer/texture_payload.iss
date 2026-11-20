@@ -20,7 +20,7 @@
 #define TextureFileCount 6287
 #endif
 #ifndef TextureCacheRoot
-#define TextureCacheRoot "{localappdata}\NHLHitzPro\Downloads"
+#define TextureCacheRoot "{app}\data\Downloads"
 #endif
 #ifndef TextureURL1
 #define TextureURL1 "https://github.com/dalves408/nhlhitzpro-recomp/releases/download/textures-2/texture-01.bin"

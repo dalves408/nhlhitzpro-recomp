@@ -212,17 +212,26 @@ def gui(backend=None):
         elif step == 1:
             label('Choose an installation folder', 21, True)
             label('Choose an empty folder for the demo.' if backend.is_demo else
-                  'Choose a new folder or your existing NHL Hitz Pro folder. Setup can reuse the game files and textures already there.')
+                  'Install into an empty folder, the folder this AppImage is in, or your existing NHL Hitz Pro '
+                  'folder (Setup reuses the game files and textures already there). Afterwards, open the '
+                  'AppImage in that folder to play.')
             ttk.Entry(body, textvariable=destination).pack(fill='x', pady=10)
             def browse():
-                selected = filedialog.askdirectory(parent=root)
+                selected = filedialog.askdirectory(parent=root, initialdir=str(Path(destination.get()).parent))
                 if selected:
                     folder = Path(selected)
-                    if backend.is_demo or not (backend.installed_game(folder) or
-                            (folder / 'texture_pack').is_dir() or (folder / '.hitz-linux-install.json').is_file()):
-                        folder /= Path(backend.default_folder).name
+                    # A folder that can be used as it is (empty, an install, or the AppImage's own) is used
+                    # directly; a folder holding other things gets an "NHL Hitz Pro" folder inside it.
+                    usable = getattr(backend, 'usable_as_is', None)
+                    if backend.is_demo or not (usable(folder) if usable else backend.installed_game(folder)):
+                        folder /= Path(backend.default_folder).name if backend.is_demo else 'NHL Hitz Pro'
                     destination.set(str(folder))
-            ttk.Button(body, text='Browse…', command=browse).pack(anchor='e')
+            buttons = tk.Frame(body, bg='#f5f6f8')
+            buttons.pack(fill='x')
+            ttk.Button(buttons, text='Browse…', command=browse).pack(side='right')
+            if getattr(backend, 'image_folder', None):
+                ttk.Button(buttons, text='Use this AppImage’s folder',
+                           command=lambda: destination.set(str(backend.image_folder))).pack(side='right', padx=8)
         elif step == 2:
             label('Your copy of the game', 22, True)
             label('Select an Xbox disc image (.iso, .xiso) or an extracted folder containing default.xbe. Setup will verify the supported USA release before installing.')
@@ -259,7 +268,7 @@ def gui(backend=None):
             else:
                 ttk.Checkbutton(body, text='Install the 4x hi-res texture pack', variable=textures).pack(anchor='w')
                 label('Uses texture-01.bin + texture-02.bin (Revision 2) or texture_pack/ beside Setup if available. Otherwise both parts are downloaded. Interrupted downloads can be resumed by running Setup again.')
-                label('Download: 1.85 GB  •  Installed textures: 2.95 GB', 10)
+                label('Download: 2.76 GB  •  Installed textures: 4.97 GB', 10)
                 if hasattr(backend, 'texture_summary'):
                     label(backend.texture_summary(), 10)
             ttk.Checkbutton(body, text='Create an application-menu shortcut', variable=shortcut).pack(anchor='w')
@@ -286,6 +295,9 @@ def gui(backend=None):
         else:
             label('You’re all set', 24, True)
             label('NHL Hitz Pro setup has finished.\n\nInstallation folder:\n' + destination.get())
+            if hasattr(backend, 'program_path'):
+                label('To play, open ' + backend.program_path(destination.get()).name +
+                      ' in that folder' + (', or use the application menu.' if shortcut.get() else '.'))
             if textures.get() or reusing_textures:
                 label('Enable hi-res textures in the configuration tool or F1 settings, with render scale at 2x or higher.')
             if backend.is_demo:

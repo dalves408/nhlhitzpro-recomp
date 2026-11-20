@@ -1,6 +1,10 @@
 /* Native OpenGL backend for the project's NV2A executor. Guest completion is
  * published by the executor only after these synchronous callbacks return. */
 #include <SDL2/SDL.h>
+#ifndef HITZ_SDL3
+#define HITZ_KEYSYM(e) ((e).key.keysym.sym)
+#define HITZ_PADBUTTON(e) ((e).cbutton.button)
+#endif
 #include <epoxy/gl.h>
 #include <math.h>
 #include <stddef.h>
@@ -219,9 +223,13 @@ static const char *vs_source=
     "gl_Position=vec4((p.xy/surf*2.0-1.0)*w,(clamp(p.z*zscale,0.0,1.0)*2.0-1.0)*w,w);\n"
     "v_color=color;v_d1=d1;v_tc[0]=tc0;v_tc[1]=tc1;v_tc[2]=tc2;v_tc[3]=tc3;v_fog=fog;}\n";
 
+extern const char *volatile nhl_gl_op;          /* recomp_manual.c: named in the GPU-wait stall report */
+extern volatile unsigned long long nhl_gl_op_start;
 static ShaderProgram *make_program(const char *source,GLuint vs)
 {
     ShaderProgram *p=&programs[program_count++];
+    unsigned long long t0=SDL_GetTicks();
+    nhl_gl_op_start=t0;nhl_gl_op="compiling and linking a shader";
     GLuint fs=shader(GL_FRAGMENT_SHADER,source);p->id=glCreateProgram();p->vs=vs;p->generic=1;
     glAttachShader(p->id,vs);glAttachShader(p->id,fs);
     if(vs!=vertex_shader){const char *varyings[]={"raw_position","v_color","v_d1","v_tc","v_fog"};glTransformFeedbackVaryings(p->id,5,varyings,GL_INTERLEAVED_ATTRIBS);}
@@ -230,6 +238,8 @@ static ShaderProgram *make_program(const char *source,GLuint vs)
     glDeleteShader(fs);glUseProgram(p->id);program=p->id;
     for(unsigned i=0;i<20;i++)p->locations[i]=glGetUniformLocation(p->id,uniform_names[i]);
     for(int i=0;i<4;i++)glUniform1i(p->locations[11+i],i);
+    nhl_gl_op=NULL;
+    {unsigned long long ms=SDL_GetTicks()-t0;if(ms>300)fprintf(stderr,"[GL-SLOW] shader %u took %llu ms to compile and link\n",(unsigned)(program_count-1),ms);}
     return p;
 }
 static void prewarm_note_program(const uint32_t *key,GLuint vs);
@@ -270,8 +280,13 @@ static void init(void)
     /* JOJO item 9: RECOMP_GL_FULLSCREEN=1 starts in desktop fullscreen (same as F11). */
     {const char *fs=getenv("RECOMP_GL_FULLSCREEN");if(fs&&fs[0]=='1'){SDL_SetWindowFullscreen(window,SDL_WINDOW_FULLSCREEN_DESKTOP);fprintf(stderr,"[GL] fullscreen (desktop)\n");}}
     xbox_InputSetMainPump(1);xbox_InputSdlInit();
-    const char *vsync=getenv("RECOMP_GL_VSYNC");SDL_GL_SetSwapInterval(vsync?atoi(vsync):0);
+#ifdef HITZ_SDL3
+    SDL_HideCursor();   /* the game is driven by pad and keyboard: no mouse pointer over it */
+#else
+    SDL_ShowCursor(SDL_DISABLE);
+#endif
     const char *hz=getenv("RECOMP_PRESENT_HZ");if(hz)present_hz=atof(hz);if(present_hz<0||present_hz>1000)present_hz=60;
+    const char *vsync=getenv("RECOMP_GL_VSYNC");SDL_GL_SetSwapInterval(vsync?atoi(vsync):0);
     /* JOJO item 5: RECOMP_GL_CAP_SYNC=1 only acts when the existing 60 or 30 FPS
      * cap is selected (RECOMP_PRESENT_HZ 59..61 -> interval 1, 29..31 -> 2). It then paces
      * with the display's swap interval (1 = vsync, -1 = adaptive if
@@ -638,12 +653,23 @@ static void textures_flush(void){for(int i=0;i<1024;i++)textures[i].valid=0;}   
 static void events(void)
 {
     SDL_Event e;
+#ifdef HITZ_SDL3
+    {   /* No mouse pointer over the game. Wayland can bring it back (after a switch to full screen, or when
+         * the pointer re-enters the window), so it is checked every frame; in full screen the pointer is also
+         * locked to the window (relative mouse mode), which keeps a trackpad from drawing one at all. */
+        static int fs_prev=-1,logged;
+        int fs=(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN)!=0;
+        if(fs!=fs_prev){SDL_SetWindowRelativeMouseMode(window,fs?true:false);fs_prev=fs;
+            fprintf(stderr,"[GL] mouse pointer: %s\n",fs?"locked to the window (full screen)":"hidden over the window");}
+        if(SDL_CursorVisible()){SDL_HideCursor();if(logged++<3)fprintf(stderr,"[GL] mouse pointer came back; hidden again\n");}
+    }
+#endif
     while(SDL_PollEvent(&e)){
         if(e.type==SDL_QUIT)exit(0);
         if(ov_event(&e))continue;   /* JOJO item 14: Esc quit prompt, F1 settings */
         xbox_InputSdlEvent(&e);
         if(e.type==SDL_KEYDOWN&&!e.key.repeat){
-            if(e.key.keysym.sym==SDLK_F11)SDL_SetWindowFullscreen(window,(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN_DESKTOP)?0:SDL_WINDOW_FULLSCREEN_DESKTOP);
+            if(HITZ_KEYSYM(e)==SDLK_F11)SDL_SetWindowFullscreen(window,(SDL_GetWindowFlags(window)&SDL_WINDOW_FULLSCREEN_DESKTOP)?0:SDL_WINDOW_FULLSCREEN_DESKTOP);
         }
     }
 }

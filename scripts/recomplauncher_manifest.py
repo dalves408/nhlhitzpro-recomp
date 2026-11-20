@@ -22,7 +22,7 @@ from pathlib import Path
 # The Europe dump (disc 26938, CRC-32 eb3dea0c) is not listed: its default.xbe is unsupported.
 DUMPS = [{'name': 'NHL Hitz Pro (USA)', 'size': 7825162240, 'crc32': '5133da30'}]
 
-DATA_WIN = '{local}/NHLHitzPro'  # %LOCALAPPDATA%\\NHLHitzPro
+DATA_WIN = '{install}/data'  # <install folder>\data: portable, nothing in %LOCALAPPDATA%
 
 
 def _setting(identifier, label, key, choices, default, help_text=None):
@@ -38,13 +38,14 @@ def _setting(identifier, label, key, choices, default, help_text=None):
 
 
 def _linux_manifest():
-    data = '{local}/nhlhitzpro'
+    data = '{install}/data'  # portable: <install folder>/data
     toggle = [('Off', 0), ('On', 1)]
     settings = [
         _setting('scale', 'Render scale', 'display/resolution_scale',
                  [(f'{n}x', n) for n in range(1, 6)], 1),
         _setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 1),
-        _setting('vsync', 'VSync', 'display/vsync', toggle, 0),
+        _setting('vsync', 'VSync', 'display/vsync', toggle, 1,
+                 'On by default: it keeps a fast camera pan smooth. Turn it off to measure frame rates.'),
         _setting('frame-cap', 'Frame cap', 'display/frame_rate',
                  [(f'{n} FPS', n) for n in (30, 60, 120, 144, 240)] + [('Unlimited', 0)], 60),
         _setting('msaa', 'MSAA', 'display/msaa', [('Off', 1)] + [(f'{n}x', n) for n in (2, 4, 8)], 1),
@@ -65,15 +66,18 @@ def _linux_manifest():
         },
         'start': {'program': ['NHLHitzPro.AppImage'], 'args': ['--play']},
         'prepare': {
-            'program': ['prepare-game.sh'],
-            'args': ['{game}'],
+            'program': ['NHLHitzPro.AppImage'],
+            'args': ['--prepare', '--game', '{game}'],
             'label': 'Verify and import NHL Hitz Pro game files',
             'timeout': 900,
         },
-        'settings': {
-            'path': data + '/settings.ini',
-            'items': settings,
-        },
+        'config': [{
+            'format': 'ini',
+            'file': [{'path': data + '/settings.ini'}],
+            'new': {key: value for row in settings for key, value in row['defaults'].items()},
+        }],
+        'settings': settings,
+        'saves': [data + '/SaveData'],
     }
 
 
@@ -84,7 +88,8 @@ def _windows_manifest():
                  '1x is the original 640x480; higher draws the game sharper but needs a faster graphics card.'),
         _setting('fullscreen', 'Fullscreen', 'display/fullscreen', toggle, 1),
         _setting('stretch', 'Stretch image', 'display/stretch', [('Off (4:3)', 0), ('On (fills window)', 1)], 0),
-        _setting('vsync', 'VSync', 'display/vsync', toggle, 0),
+        _setting('vsync', 'VSync', 'display/vsync', toggle, 1,
+                 'On by default: it keeps a fast camera pan smooth. Turn it off to measure frame rates.'),
         _setting('frame-rate', 'Frame rate', 'display/frame_rate',
                  [(f'{n} FPS', n) for n in (30, 60, 120, 144, 240, 360)], 60,
                  '60 is the original. Higher rates run the game smoother; the intro movies always play at 60.'),
@@ -157,7 +162,9 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     archive = args.out / f'NHLHitzPro-v{args.version}-Windows-x64.zip'
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as package:
-        for name in ('nhl_hitz_pro_recomp.exe', 'nhl_import.exe', 'config.exe'):
+        for name in ('nhl_hitz_pro_recomp.exe', 'nhl_import.exe', 'config.exe', 'SDL3.dll'):
+            if name == 'SDL3.dll' and not (args.build / name).exists():
+                continue                      # only the 64-bit build has it
             package.write(args.build / name, name)
         package.writestr('recomplauncher.json', text)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()

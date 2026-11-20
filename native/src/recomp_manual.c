@@ -427,15 +427,38 @@ void nhl_guest_wbinvd(void)
  * completion word. No submitted values are copied into completion memory.
  * Target is the fence record selected by D3D at guest 0x00254037.
  */
+/* What the renderer is doing when it is slow (a shader compile and link, for example): set by the renderer around
+ * that work and named in the stall report below, so a hang says where it is. */
+const char *volatile nhl_gl_op;
+volatile unsigned long long nhl_gl_op_start;
+
 void nhl_wait_gpu_fence(uint32_t word, uint32_t target)
 {
     volatile LONG *completed = (volatile LONG *)((uintptr_t)g_xbox_mem_offset + word);
-    ULONGLONG start = GetTickCount64();
+    ULONGLONG start = GetTickCount64(), noted = start;
+    /* The wait gives up (and the game stops with code 87) when the GPU side makes no progress. 10 s was too short
+     * for a first run on a slow machine, where every shader is compiled on the spot: 60 s now, and
+     * RECOMP_GPU_WAIT_MS changes it. It says so every 5 s while it waits. */
+    static unsigned long limit_ms;
+    if (!limit_ms) {
+        const char *e = getenv("RECOMP_GPU_WAIT_MS");
+        limit_ms = e && atol(e) > 0 ? (unsigned long)atol(e) : 60000ul;
+    }
     while ((int32_t)((uint32_t)InterlockedCompareExchange(completed, 0, 0) - target) < 0) {
-        if (GetTickCount64() - start > 10000) {
-            fprintf(stderr, "[GPUWAIT] stalled: word=%08X completed=%08X target=%08X\n",
-                    word, (uint32_t)*completed, target);
+        ULONGLONG now = GetTickCount64();
+        if (now - start > limit_ms) {
+            const char *op = nhl_gl_op;
+            fprintf(stderr, "[GPUWAIT] stalled: word=%08X completed=%08X target=%08X after %lu ms; renderer: %s%s\n",
+                    word, (uint32_t)*completed, target, limit_ms, op ? op : "idle or unknown",
+                    op ? " (since it started the render thread has not come back)" : "");
             _Exit(87);
+        }
+        if (now - noted >= 5000) {
+            const char *op = nhl_gl_op;
+            noted = now;
+            fprintf(stderr, "[GPUWAIT] still waiting after %llu s: completed=%08X target=%08X; renderer: %s (%llu ms)\n",
+                    (unsigned long long)((now - start) / 1000), (uint32_t)*completed, target,
+                    op ? op : "idle or unknown", op ? (unsigned long long)(now - nhl_gl_op_start) : 0ull);
         }
         Sleep(1);
     }

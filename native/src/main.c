@@ -93,10 +93,11 @@ extern ptrdiff_t g_xbox_mem_offset;
 #endif
 
 #ifdef NHL_RELEASE
+#include "nhl_data_dir.h"
 /* Release build (cmake -DNHL_RELEASE=ON): no logging, no diagnostic switches,
- * and everything the game writes goes to %LOCALAPPDATA%\NHLHitzPro so an
- * install under Program Files works. */
-static char s_user_data[MAX_PATH];     /* %LOCALAPPDATA%\NHLHitzPro\SaveData */
+ * and everything the game writes goes to <install folder>\data (a portable
+ * layout; %LOCALAPPDATA%\NHLHitzPro only when that cannot be written). */
+static char s_user_data[MAX_PATH];     /* <install folder>\data\SaveData */
 #ifdef NHL_DEBUGLOG
 extern void nhl_debug_init(void);      /* debug_report.c */
 #endif
@@ -141,10 +142,9 @@ static void release_init(void)
         }
         FreeEnvironmentStringsA(env);
     }
-    if (GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) == 0 || strlen(base) > MAX_PATH - 64)
+    /* Portable layout: everything the game writes is in <install folder>\\data (nhl_data_dir.h). */
+    if (!nhl_data_dir(base, sizeof base))
         strcpy(base, ".");
-    strcat(base, "\\NHLHitzPro");
-    CreateDirectoryA(base, NULL);
     snprintf(s_user_data, sizeof s_user_data, "%s\\SaveData", base);
     snprintf(cache, sizeof cache, "%s\\shadercache", base);
     _putenv_s("RECOMP_D3D11_SHADERCACHE_DIR", cache);

@@ -9,7 +9,7 @@
  * flip().
  *
  * Environment (all optional):
- *   RECOMP_D3D11_VSYNC=1       present with vsync (default: no vsync, to measure)
+ *   RECOMP_D3D11_VSYNC=1       present with vsync (default: the settings.ini choice, VSync on if none)
  *   RECOMP_D3D11_LOG=1         log every distinct render surface and state seen
  *   RECOMP_FB_DUMP=<prefix>    with RECOMP_FB_WINDOW_DUMP_EVERY=<n>: dump the
  *                              presented image as <prefix>d3d_<k>.bmp
@@ -23,6 +23,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "nhl_data_dir.h"   /* overrides/: the portable data folder */
 #include <tlhelp32.h>
 #include <dbghelp.h>      /* types only (RECOMP_FLIPTIME_PROF); dbghelp.dll is loaded at run time */
 #include <d3d11.h>
@@ -198,7 +199,7 @@ static int s_q_cw, s_q_ch, s_q_ox, s_q_oy; /* what was last drawn */
  * The same layered overlay window as the quit prompt, in another mode, and the same pause
  * (clocks, vblank thread, flips and sound all stop while it is open). Up/Down choose a
  * line, Left/Right (or Enter) change it, Esc or F1 close it; the mouse works too. Choices
- * are saved at once in %LOCALAPPDATA%\NHLHitzPro\settings.ini, [display]:
+ * are saved at once in <install folder>\data\settings.ini, [display]:
  *   resolution_scale = 1..5   internal resolution, a multiple of the Xbox's 640x480
  *   vsync, anisotropy (1, 2, 4, 8, 16), fullscreen (see want_fullscreen_at_start) */
 static int s_scale = 1;           /* internal resolution: 1..5 x the Xbox's 640x480 */
@@ -329,6 +330,7 @@ static int pack_installed(void);
 static const unsigned SET_FPS_HZ[6] = { 30, 60, 120, 144, 240, 360 };   /* the last is "uncapped": more only costs CPU (1000 measured slower) */
 extern void xbox_set_vblank_hz(unsigned hz);   /* kernel_bridge.c override: the display rate the game sees */
 
+
 /* The most samples (up to the chosen number) the card supports for both the colour and depth formats. */
 static int msaa_effective(void)
 {
@@ -352,13 +354,7 @@ enum { IT_RES, IT_FS, IT_STRETCH, IT_VSYNC, IT_FPS, IT_AA, IT_ANISO, IT_HIRES, I
 
 static int cfg_path(char *out, size_t n)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
-        return 0;
-    snprintf(out, n, "%s\\NHLHitzPro", base);
-    CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\NHLHitzPro\\settings.ini", base);
-    return 1;
+    return nhl_data_path(out, n, "settings.ini");
 }
 
 static int cfg_get(const char *key, int def)
@@ -411,8 +407,14 @@ static void settings_load(void)
     }
     a = cfg_get("anisotropy", 1);
     s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 1;
-    if (!getenv("RECOMP_D3D11_VSYNC"))
-        g.vsync = cfg_get("vsync", 0) != 0;
+    if (!getenv("RECOMP_D3D11_VSYNC")) {
+        /* A new install (no settings.ini yet) starts with VSync on: without it the game's own 60 fps timer
+         * beats against the screen and a fast camera pan judders. An existing settings file is left alone. */
+        char sp[MAX_PATH];
+        if (cfg_path(sp, sizeof sp) && GetFileAttributesA(sp) == INVALID_FILE_ATTRIBUTES)
+            cfg_put("vsync", 1);
+        g.vsync = cfg_get("vsync", 1) != 0;   /* on unless the player turned it off */
+    }
     {   /* hi-res texture pack: the master switch and one switch per kind of texture */
         static const char *const k[5] = { "rink", "logos", "jerseys", "glow", "other" };
         int i;
@@ -732,6 +734,12 @@ static void quit_draw(void)
 
 static void quit_open(void)
 {
+    /* The overlay window is owned by the game window; if that is not this window any more (or the
+     * handle is gone) it can never show, so it is made again. */
+    if (s_q_hwnd && (!IsWindow(s_q_hwnd) || GetWindow(s_q_hwnd, GW_OWNER) != g.hwnd)) {
+        if (IsWindow(s_q_hwnd)) DestroyWindow(s_q_hwnd);
+        s_q_hwnd = NULL;
+    }
     if (!s_q_hwnd) {
         WNDCLASSA wc;
         memset(&wc, 0, sizeof wc);
@@ -751,10 +759,23 @@ static void quit_open(void)
     xa2_set_muted(1);
     quit_draw();
     ShowWindow(s_q_hwnd, SW_SHOWNOACTIVATE);
+#ifdef NHL_DEBUGLOG
+    {   /* overlay diagnostics: did the overlay window really come up? */
+        RECT wr;
+        GetWindowRect(s_q_hwnd, &wr);
+        fprintf(stderr, "[OVERLAY] open: hwnd=%p valid=%d visible=%d owner_ok=%d rect=%ld,%ld-%ld,%ld game_hwnd=%p fg=%d tid=%lu\n",
+                (void *)s_q_hwnd, IsWindow(s_q_hwnd) != 0, IsWindowVisible(s_q_hwnd) != 0,
+                GetWindow(s_q_hwnd, GW_OWNER) == g.hwnd, wr.left, wr.top, wr.right, wr.bottom,
+                (void *)g.hwnd, GetForegroundWindow() == g.hwnd, (unsigned long)GetCurrentThreadId());
+    }
+#endif
 }
 
 static void quit_close(void)
 {
+#ifdef NHL_DEBUGLOG
+    fprintf(stderr, "[OVERLAY] close: active=%d set_active=%d hwnd=%p\n", s_q_active, s_set_active, (void *)s_q_hwnd);
+#endif
     if (s_q_active) {
         xa2_set_muted(0); xbox_time_pause_end();
         s_unblock_wait = 1; s_unblock_t = GetTickCount();         /* neutral until the buttons are released */
@@ -768,6 +789,17 @@ static void quit_close(void)
  * to choose and change, A to confirm, B or Start to close. Other controllers do nothing. */
 typedef struct { DWORD pkt; WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } NhlPadState;
 extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+#ifdef NHL_SDL3
+/* Controller 1 may be an SDL3 pad (overrides/xinput_device.c): ask the input layer, in XInput's layout. */
+extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt, SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
+static DWORD nhl_pad0(NhlPadState *st)
+{
+    st->pkt = 0;
+    return hitz_PadPeek(0, &st->buttons, &st->lt, &st->rt, &st->lx, &st->ly, &st->rx, &st->ry) ? 0 : 1;
+}
+#else
+static DWORD nhl_pad0(NhlPadState *st) { return XInputGetState(0, st); }
+#endif
 static WORD s_pad_prev;
 static DWORD s_pad_rep;
 
@@ -777,7 +809,7 @@ static void pad_overlay_poll(void)
     WORD b, press, dirs;
     DWORD now = GetTickCount();
     if (!s_q_active) return;
-    if (XInputGetState(0, &st) != 0) { s_pad_prev = 0; s_pad_valid = 1; return; }
+    if (nhl_pad0(&st) != 0) { s_pad_prev = 0; s_pad_valid = 1; return; }
     b = st.buttons;
     if (st.lx < -16000) b |= 0x0004;
     if (st.lx > 16000)  b |= 0x0008;
@@ -807,7 +839,7 @@ static void pad_unblock_tick(void)
 {
     NhlPadState st;
     if (!s_unblock_wait) return;
-    if (XInputGetState(0, &st) != 0 || (st.buttons == 0 && st.lx > -16000 && st.lx < 16000 &&
+    if (nhl_pad0(&st) != 0 || (st.buttons == 0 && st.lx > -16000 && st.lx < 16000 &&
                                         st.ly > -16000 && st.ly < 16000) ||
         GetTickCount() - s_unblock_t > 2000) {
         nhl_input_block = 0;
@@ -829,7 +861,7 @@ static void pad_open_poll(void)
     NhlPadState st;
     WORD b;
     if (s_q_active) return;
-    if (XInputGetState(0, &st) != 0) { prev = 0; return; }
+    if (nhl_pad0(&st) != 0) { prev = 0; return; }
     b = st.buttons;
     if ((b & 0x0020) && (b & 0x0010) && !(prev & 0x0010)) {
         prev = b;
@@ -918,6 +950,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             return 0;
         }
         if (w == VK_F1) {                  /* settings menu */
+#ifdef NHL_DEBUGLOG
+            fprintf(stderr, "[OVERLAY] F1 key: q_active=%d set_active=%d repeat=%d\n", s_q_active, s_set_active, (l & (1L << 30)) != 0);
+#endif
             if (!(l & (1L << 30))) { if (!s_q_active) set_open(); else if (s_set_active) quit_close(); }
             return 0;
         }
@@ -1889,7 +1924,7 @@ static uint64_t px_hash(uint32_t w, uint32_t hh, const uint32_t *px)
 
 /* ---- texture replacement pack ----
  * Files named <16 hex digits of the texture's content hash>*.dds|png|bmp (as written by RECOMP_TEXDUMP_ALL) in the
- * folder RECOMP_TEXPACK, or %LOCALAPPDATA%\NHLHitzPro\texture_pack, are used in place of the decoded texture.
+ * folder RECOMP_TEXPACK, or <install folder>\data\texture_pack, are used in place of the decoded texture.
  * The replacement may be any size; the game's texture coordinates are scaled by the original size, so
  * a 4x image simply samples sharper. Pack textures always get a mip chain. */
 typedef struct {
@@ -2008,8 +2043,7 @@ static void pack_init(void)
     } else {
         /* The user's folder first (a file found there wins), then the pack the installer put
            next to the exe. */
-        if (GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof dir - 32)) {
-            strcat(dir, "\\NHLHitzPro\\texture_pack");
+        if (nhl_data_path(dir, sizeof dir - 32, "texture_pack")) {
             pack_scan(dir, 0, 4);
         }
         if (GetModuleFileNameA(NULL, dir, sizeof dir - 32)) {
@@ -3408,17 +3442,11 @@ static void toggle_fullscreen(HWND h)
 }
 
 /* The player build starts fullscreen and remembers the last mode in
- * %LOCALAPPDATA%\NHLHitzPro\settings.ini ("fullscreen=1" or "fullscreen=0"). */
+ * <install folder>\data\settings.ini ("fullscreen=1" or "fullscreen=0"). */
 #ifdef NHL_RELEASE
 static int settings_path(char *out, size_t n)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
-        return 0;
-    snprintf(out, n, "%s\\NHLHitzPro", base);
-    CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\NHLHitzPro\\settings.ini", base);
-    return 1;
+    return nhl_data_path(out, n, "settings.ini");
 }
 
 static int want_fullscreen_at_start(void)

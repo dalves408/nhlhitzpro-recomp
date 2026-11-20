@@ -57,7 +57,7 @@ Debug flavour (never part of a release): see `native/DEBUG-BUILD.md`. The last o
 
 1. Rebuild the debug installer (version 1.0.8.1 or a new one) and test the folder page on another PC: fresh install, update over an existing install, changing the folder, uninstall.
 2. Open the launcher ZIP in RecompLauncher (Settings > Developers > Add a build > the extracted ZIP). Check the Level 3 badge, the settings rows, Play, and `bigpicture` vs `desktop`.
-3. Check the `section/key` setting keys (for example `display/fullscreen`) are written correctly into `%LOCALAPPDATA%\NHLHitzPro\settings.ini`. This form is unverified and follows the NHL Hitz 2003 build.
+3. Check the `section/key` setting keys (for example `display/fullscreen`) are written correctly into `<install folder>\data\settings.ini`. This form is unverified and follows the NHL Hitz 2003 build.
 4. The Redump verified badge needs a full 7,825,162,240-byte Redump-style image (CRC-32 `5133da30`). David's 1.5 GB trimmed XISO imports fine but gets no badge.
 5. The release build writes no log, so the launcher's crash report has nothing to attach. Decide whether to change that.
 6. For a release: new version number, tests on other PCs, then David publishes. Installers are unsigned, so SmartScreen warns on other PCs (More info, then Run anyway). Remind him on each installer build.

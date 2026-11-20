@@ -85,7 +85,9 @@ int main(int argc, char **argv)
     } else snprintf(game,sizeof(game),"%s/game_files",root);
     snprintf(xbe,sizeof(xbe),"%s/default.xbe",game);
     const char *data=getenv("XDG_DATA_HOME"), *home=getenv("HOME");
-    if (data && *data) snprintf(saves,sizeof(saves),"%s/nhlhitzpro/SaveData",data);
+    const char *portable=getenv("NHLHITZPRO_DATA");   /* <install folder>/data, set by play.sh */
+    if (portable && *portable) snprintf(saves,sizeof(saves),"%s/SaveData",portable);
+    else if (data && *data) snprintf(saves,sizeof(saves),"%s/nhlhitzpro/SaveData",data);
     else if (home) snprintf(saves,sizeof(saves),"%s/.local/share/nhlhitzpro/SaveData",home);
     else { fprintf(stderr,"Set HOME or XDG_DATA_HOME for saves\n"); return 1; }
     if (!make_dirs(saves)) { perror(saves); return 1; }

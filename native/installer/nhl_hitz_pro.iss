@@ -7,7 +7,7 @@
 ; it does not ask for the disc and does not copy the 1.5 GB of game files again.
 ; ISCC /DAppVersion=... /DBuildDir=... /DOutSuffix=-debug /DDebugBuild=1 build a local debug installer (see collect_debug.ps1)
 #ifndef AppVersion
-#define AppVersion "1.0.9"
+#define AppVersion "1.1.0"
 #endif
 #ifndef OutSuffix
 #define OutSuffix ""
@@ -32,9 +32,12 @@ AppPublisherURL=https://github.com/dalves408/nhlhitzpro-recomp
 DefaultDirName=C:\Games\NHL Hitz Pro
 DefaultGroupName=NHL Hitz Pro
 DisableProgramGroupPage=yes
-; fresh install defaults to C:\Games\NHL Hitz Pro; an existing install is found by AppId and its folder is pre-filled; the folder page is always shown so it can be changed
+; Portable game: no uninstaller and no entry in Windows' Installed Apps. Everything lives in the install folder (saves and settings in its "data" folder);
+; delete the folder to remove the game. A fresh install suggests C:\Games\NHL Hitz Pro; an existing install is found by looking in that folder (or where an older Setup put it) and its folder is pre-filled; the folder page is always shown so it can be changed
 DisableDirPage=no
-UsePreviousAppDir=yes
+UsePreviousAppDir=no
+Uninstallable=no
+CreateUninstallRegKey=no
 ; a running game or settings program is closed so its exe can be replaced
 CloseApplications=yes
 CloseApplicationsFilter=nhl_hitz_pro_recomp.exe,config.exe
@@ -45,7 +48,6 @@ MinVersion=10.0
 SetupIconFile=..\resources\nhl_hitz_pro.ico
 ; the picture at the top right of every wizard page is the same icon (the sizes are for different screen scalings)
 WizardSmallImageFile=wizard_small_55.bmp,wizard_small_64.bmp,wizard_small_80.bmp,wizard_small_96.bmp,wizard_small_128.bmp
-UninstallDisplayIcon={app}\nhl_hitz_pro_recomp.exe
 OutputBaseFilename=NHLHitzPro-Setup-{#AppVersion}{#OutSuffix}
 Compression=lzma2
 SolidCompression=yes
@@ -58,6 +60,10 @@ WelcomeLabel2=This installs the NHL Hitz Pro PC recompilation.%n%nThe game's own
 [Files]
 Source: "{#BuildDir}\nhl_hitz_pro_recomp.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\config.exe"; DestDir: "{app}"; Flags: ignoreversion
+; SDL3: the player reads controllers that are not Xbox pads through it (the 64-bit build)
+#if FileExists(BuildDir + "\SDL3.dll")
+Source: "{#BuildDir}\SDL3.dll"; DestDir: "{app}"; Flags: ignoreversion
+#endif
 ; the import tool only runs during setup; it is not installed
 Source: "{#BuildDir}\nhl_import.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall
 Source: "{#BuildDir}\nhl_texture_download.exe"; Flags: dontcopy
@@ -83,11 +89,10 @@ Name: "{autoprograms}\NHL Hitz Pro - Collect debug files"; Filename: "{sys}\Wind
 Name: "hires"; Description: "Install the 4x hi-res texture pack (2.76 GB download if needed)"; Flags: unchecked; Check: TexturePackNeedsInstall
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 
-[UninstallDelete]
-Type: filesandordirs; Name: "{app}\game_files"
-; the hi-res texture pack (added by its own installer) and that installer's uninstall files
-Type: filesandordirs; Name: "{app}\texture_pack"
-Type: filesandordirs; Name: "{app}\addons"
+[Registry]
+; 1.0.x installers registered an uninstaller; this one is portable, so take that entry out of Installed Apps
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#GameGuid}}_is1"; Flags: dontcreatekey deletekey
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Uninstall\{{{#PackGuid}}_is1"; Flags: dontcreatekey deletekey
 
 [Code]
 var
@@ -112,7 +117,8 @@ begin
             FileExists(Dir + '\game_files\Jerseys\Jerseys.cmn');
 end;
 
-{ Where a previous Setup put the game, or '' }
+{ Where a previous Setup put the game, or ''. 1.0.x Setups left a registry entry with the folder; this one
+  leaves nothing behind, so the usual folder is looked at too. }
 function PreviousAppDir: String;
 var
   Key, Dir: String;
@@ -122,14 +128,20 @@ begin
   if RegQueryStringValue(HKCU, Key, 'Inno Setup: App Path', Dir) or
      RegQueryStringValue(HKLM, Key, 'Inno Setup: App Path', Dir) then
     Result := RemoveBackslashUnlessRoot(Dir);
+  if (Result = '') and GameFilesPresent('C:\Games\NHL Hitz Pro') then
+    Result := 'C:\Games\NHL Hitz Pro';
 end;
 
-{ The version a previous Setup recorded, or '' }
-function PreviousVersion: String;
+{ The version installed in Dir: version.txt (written by this Setup), else what a 1.0.x Setup recorded, or '' }
+function PreviousVersion(Dir: String): String;
 var
   Key, V: String;
+  Lines: TArrayOfString;
 begin
   Result := '';
+  if LoadStringsFromFile(Dir + '\version.txt', Lines) and (GetArrayLength(Lines) > 0) then
+    Result := Trim(Lines[0]);
+  if Result <> '' then Exit;
   Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#GameGuid}}_is1';
   if RegQueryStringValue(HKCU, Key, 'DisplayVersion', V) or
      RegQueryStringValue(HKLM, Key, 'DisplayVersion', V) then
@@ -272,7 +284,8 @@ begin
   UpdateMode := (OldDir <> '') and GameFilesPresent(OldDir);
   if UpdateMode then
   begin
-    OldVer := PreviousVersion;
+    OldVer := PreviousVersion(OldDir);
+    WizardForm.DirEdit.Text := OldDir;     { the installed game's folder is suggested }
     if OldVer <> '' then VerRel := CompareVer(OldVer, NewVer) else VerRel := -1;
     WizardForm.WelcomeLabel2.Caption :=
       'NHL Hitz Pro is already installed on this computer.' + #13#10#13#10 +
@@ -417,6 +430,14 @@ var
 begin
   if CurStep = ssInstall then
     UpdateOnly := GameFilesPresent(ExpandConstant('{app}'));
+  if CurStep = ssPostInstall then
+  begin
+    { which version this folder holds (read by the next Setup) and the leftovers of the old uninstaller }
+    SaveStringToFile(ExpandConstant('{app}\version.txt'), '{#AppVersion}' + #13#10, False);
+    DeleteFile(ExpandConstant('{app}\unins000.exe'));
+    DeleteFile(ExpandConstant('{app}\unins000.dat'));
+    DeleteFile(ExpandConstant('{app}\unins000.msg'));
+  end;
   if (CurStep = ssPostInstall) and not UpdateOnly then
   begin
     WizardForm.StatusLabel.Caption := 'Copying the game files from your disc (about 1.5 GB, a few minutes)...';
@@ -456,10 +477,3 @@ begin
     Result := 1;
 end;
 
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
-begin
-  { Rev2 textures register a separate ARP entry (extraction-only, no unins000). }
-  if CurUninstallStep = usPostUninstall then
-    RegDeleteKeyIncludingSubkeys(HKCU,
-      'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#PackGuid}}_is1');
-end;

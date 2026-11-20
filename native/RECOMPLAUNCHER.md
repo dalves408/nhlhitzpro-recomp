@@ -8,8 +8,8 @@ importer, writes the settings and starts the game. The normal Inno Setup install
 
 | Level | What | Where |
 |---|---|---|
-| 1 | start `nhl_hitz_pro_recomp.exe`; the player's own USA disc (`iso_or_folder`, `default.xbe` check); saves in `%LOCALAPPDATA%\NHLHitzPro\SaveData` | `scripts/recomplauncher_manifest.py` |
-| 2 | settings written to `%LOCALAPPDATA%\NHLHitzPro\settings.ini`: render scale, fullscreen, stretch, VSync, frame rate, anti-aliasing, anisotropic filtering, hi-res textures (the same keys the F1 menu and `config.exe` use) | same |
+| 1 | start `nhl_hitz_pro_recomp.exe`; the player's own USA disc (`iso_or_folder`, `default.xbe` check); saves in `{install}/data/SaveData` (portable: the game's own `data` folder) | `scripts/recomplauncher_manifest.py` |
+| 2 | settings written to `{install}/data/settings.ini`: render scale, fullscreen, stretch, VSync, frame rate, anti-aliasing, anisotropic filtering, hi-res textures (the same keys the F1 menu and `config.exe` use) | same |
 | 3 | `prepare`: `nhl_import.exe --prepare {game} {install}/game_files`; `game.dumps`: Redump entry for NHL Hitz Pro (USA), serial MW-026 | same, `native/installer/nhl_import.c` |
 
 `nhl_import --prepare <source> <dest>` is the headless setup step: no window, `progress <0..1> <text>` lines on stdout, exit 0 only

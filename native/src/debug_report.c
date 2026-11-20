@@ -1,7 +1,7 @@
 /* Self-monitoring for the debug build (cmake -DNHL_DEBUGLOG=ON, on top of NHL_RELEASE).
  *
  * Runs inside the game: nothing outside the installed files is needed on the player's PC (dbghelp.dll and
- * xinput come with Windows). Everything lands in %LOCALAPPDATA%\NHLHitzPro\debug:
+ * xinput come with Windows). Everything lands in <install folder>\data\debug:
  *
  *   session_<date>_<time>.log   everything the game prints (stdout and stderr), rotated at 96 MB per half so
  *                               the last ~100-190 MB of a long session is kept; the 6 newest sessions are kept
@@ -23,6 +23,7 @@
 #ifdef NHL_DEBUGLOG
 
 #include <windows.h>
+#include "nhl_data_dir.h"   /* overrides/: the portable data folder */
 #include <dbghelp.h>
 #include <io.h>
 #include <fcntl.h>
@@ -48,7 +49,12 @@
 
 extern uint64_t nhl_flip_count(void);                    /* backend_d3d11.c */
 extern void nhl_crash_context(PEXCEPTION_POINTERS ep);   /* main.c: guest registers and call chain */
+#ifdef NHL_SDL3
+/* The SDL3 player reads every pad through overrides/xinput_device.c; the pad log asks it, in XInput's layout. */
+extern int hitz_PadPeek(DWORD port, WORD *buttons, BYTE *lt, BYTE *rt, SHORT *lx, SHORT *ly, SHORT *rx, SHORT *ry);
+#else
 extern DWORD WINAPI XInputGetState(DWORD user, void *state);
+#endif
 static void show_banner(const char *title, const char *l2, const char *l3, DWORD ms, COLORREF accent);
 extern ptrdiff_t g_xbox_mem_offset;                       /* host address = guest address + this */
 
@@ -530,7 +536,11 @@ static DWORD WINAPI pad_thread(LPVOID unused)
         if (scan) last_scan = t;
         for (i = 0; i < 4; i++) {
             if (!alive[i] && !scan) continue;
+#ifdef NHL_SDL3
+            if (!hitz_PadPeek((DWORD)i, &cur.buttons, &cur.lt, &cur.rt, &cur.lx, &cur.ly, &cur.rx, &cur.ry)) {
+#else
             if (XInputGetState((DWORD)i, &cur) != 0) {
+#endif
                 if (alive[i]) { alive[i] = 0; fprintf(stderr, "[PADLOG] t=%.3f pad=%d disconnected\n", now_s(), i); }
                 continue;
             }
@@ -599,11 +609,10 @@ static void print_header(void)
     }
     fprintf(stderr, "log folder  : %s\n", s_dir);
     {
-        char base[MAX_PATH], p[MAX_PATH], text[2048];
+        char p[MAX_PATH], text[2048];
         DWORD got = 0;
         HANDLE f;
-        GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base);
-        snprintf(p, sizeof p, "%s\\NHLHitzPro\\settings.ini", base);
+        if (!nhl_data_path(p, sizeof p, "settings.ini")) p[0] = 0;
         f = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
         if (f != INVALID_HANDLE_VALUE) {
             if (ReadFile(f, text, sizeof text - 1, &got, NULL)) { text[got] = 0; fprintf(stderr, "settings.ini:\n%s\n", text); }
@@ -739,9 +748,8 @@ void nhl_debug_init(void)
     DWORD attr;
 
     s_t0 = GetTickCount64();
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 80) strcpy(base, ".");
-    snprintf(s_dir, sizeof s_dir, "%s\\NHLHitzPro", base);
-    CreateDirectoryA(s_dir, NULL);
+    if (!nhl_data_dir(base, sizeof base) || strlen(base) > MAX_PATH - 80) strcpy(base, ".");
+    snprintf(s_dir, sizeof s_dir, "%s", base);
     strcat(s_dir, "\\debug");
     CreateDirectoryA(s_dir, NULL);
     GetLocalTime(&st);

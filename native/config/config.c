@@ -1,13 +1,14 @@
 /* config.exe -- the player's settings program, installed next to the game.
  *
  * Video tab: the same options as the game's F1 menu, so they can be set before the game runs.
- * They are saved in %LOCALAPPDATA%\NHLHitzPro\settings.ini, [display], and read when the game starts.
+ * They are saved in <install folder>\data\settings.ini, [display], and read when the game starts.
  * Textures tab: switches for the hi-res texture pack (greyed out with a download button when it is not installed),
  * saved in settings.ini, [textures]: enabled and one key per kind of texture (rink, logos, jerseys, glow, other).
  * Controls tab: a keyboard remapper. Each Xbox control has a key and an alternate key, saved in
- * %LOCALAPPDATA%\NHLHitzPro\keymap.ini (see overrides/nhl_keymap.h). */
+ * <install folder>\data\keymap.ini (see overrides/nhl_keymap.h). */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "../overrides/nhl_data_dir.h"
 #include <commctrl.h>
 #include <stdio.h>
 #include <string.h>
@@ -148,8 +149,7 @@ static int pack_installed(void)
         strcpy(sl, "\\texture_pack");
         if (has_pictures(d, 0)) return 1;
     }
-    if (GetEnvironmentVariableA("LOCALAPPDATA", d, sizeof d - 40)) {
-        strcat(d, "\\NHLHitzPro\\texture_pack");
+    if (nhl_data_path(d, sizeof d - 40, "texture_pack")) {
         if (has_pictures(d, 0)) return 1;
     }
     return 0;
@@ -157,12 +157,9 @@ static int pack_installed(void)
 
 static void ini_path(const char *name, char *out, size_t n, int create_dir)
 {
-    char base[MAX_PATH];
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base))
-        strcpy(base, ".");
-    snprintf(out, n, "%s\\NHLHitzPro", base);
-    if (create_dir) CreateDirectoryA(out, NULL);
-    snprintf(out, n, "%s\\NHLHitzPro\\%s", base, name);
+    (void)create_dir;                       /* nhl_data_dir makes the folder */
+    if (!nhl_data_path(out, n, name))
+        snprintf(out, n, "%s", name);
 }
 
 /* ---- load and save --------------------------------------------------------------------------- */

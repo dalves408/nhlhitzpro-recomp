@@ -18,6 +18,7 @@
  */
 #include "keyboard.h"
 #include "input_map.h"
+#include "nhl_data_dir.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -153,7 +154,7 @@ static int row_control(const xbox_key_row *r)
 }
 
 /* PROJECT OVERRIDE (NHL Hitz Pro): the player's own keys. config.exe writes
- * %LOCALAPPDATA%\NHLHitzPro\keymap.ini (see nhl_keymap.h); it is read once, on the first
+ * <install folder>\data\keymap.ini (see nhl_keymap.h); it is read once, on the first
  * poll, and a key missing from it keeps the default in xbox_key_map[]. */
 static uint8_t s_ovr[NHL_KEYMAP_COUNT][2];
 static int     s_ovr_set[NHL_KEYMAP_COUNT];
@@ -170,9 +171,9 @@ static void keymap_load(void)
     char base[MAX_PATH], path[MAX_PATH], key[48];
     int i;
 
-    if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof base) || strlen(base) > MAX_PATH - 40)
+    (void)base;
+    if (!nhl_data_path(path, sizeof path, "keymap.ini"))
         return;
-    snprintf(path, sizeof path, "%s\\NHLHitzPro\\keymap.ini", base);
     if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
         return;
     for (i = 0; i < NHL_KEYMAP_COUNT && (size_t)i < xbox_key_map_count; i++) {

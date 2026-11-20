@@ -30,17 +30,17 @@ Without `--appimagetool` / `--appimage-runtime`, the builder falls back to a `.r
 | Menu shortcuts | Game + **Settings** entries (selected by default); Pro icon |
 | Launch / Configure | Finish page can start `play.sh` or `settings.sh` (`nhl_config.py`) |
 | Noninteractive | `--install DIR [--source PATH] [--no-textures] [--no-shortcuts]` |
-| Uninstall | Removes unchanged program files + recorded shortcuts; keeps game data/textures/settings |
+| Uninstall | None: the game is portable, delete the install folder. Everything it writes is in `<install folder>/data` |
 | Menu repair | `install-shortcuts.py` / `NHLHitzPro-Repair-Menu.py` |
 | AppImage / tar.gz | Optional via `--appimagetool` + `--appimage-runtime` |
 
 ## Branding / paths
 
 - Binary: `nhl_hitz_pro_recomp`
-- XDG data/cache: `nhlhitzpro`
+- Data: `<install folder>/data` (`NHLHITZPRO_DATA`, set by `play.sh` and the AppImage); older versions used `~/.local/share/nhlhitzpro` and `~/.cache/nhlhitzpro`
 - Default install: `~/Games/NHL Hitz Pro`
 - Icon: `native/resources/nhl_hitz_pro.png` (from Pro `.ico`) → packaged `icon.png`
-- Log: `play.sh` writes `~/.local/share/nhlhitzpro/logs/play.log` (header with version, distro, glibc, session type and game files, then the game's output and the exit code); the previous run is kept as `play.previous.log`. A run that fails or ends within 10 s prints the log path and its last 15 lines on the terminal (and a `notify-send` message when available).
+- Log: `play.sh` writes `<install folder>/data/logs/play.log` (header with version, distro, glibc, session type and game files, then the game's output and the exit code); the previous run is kept as `play.previous.log`. A run that fails or ends within 10 s prints the log path and its last 15 lines on the terminal (and a `notify-send` message when available).
 - Settings app: `linux/nhl_config.py` (Video / Controls / Textures), desktop shortcut beside the game
 
 ## Texture pack (Pro-specific)

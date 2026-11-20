@@ -47,3 +47,7 @@ game/
 # OS
 Thumbs.db
 .DS_Store
+
+# The SDL3 development package the Windows player links against and ships (SDL3.dll)
+!third_party/SDL3-3.4.20/lib/x64/
+!third_party/SDL3-3.4.20/lib/x64/*

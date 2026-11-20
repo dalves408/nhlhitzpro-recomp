@@ -175,6 +175,84 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ====================  SDL2 GameController backend  ===================== */
 /* ======================================================================== */
 
+#ifdef HITZ_SDL3
+#include <SDL3/SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Every pad comes from SDL (overrides/sdl3_pad.inc): Xbox, PlayStation,
+ * Switch and generic pads alike. */
+#include "../sdl3_pad.inc"
+
+/* Kept for callers written against the SDL2 presenter, which pumped events
+ * on its own thread; the SDL3 player pumps in backend_gl.c's event loop. */
+static volatile int g_main_pump;
+
+void xbox_InputSetMainPump(int on)
+{
+    g_main_pump = on;
+}
+
+/* Whether any controller is open: SDL must stay up for it at shutdown. */
+int xbox_InputAnyOpen(void)
+{
+    return sdlpad_any_open();
+}
+
+void xbox_InputInit(void)
+{
+    sdlpad_init();
+    if (sp_log_on() && !sdlpad_any_open())
+        fprintf(stderr, "[PAD] no gamepad found at start (plug one in; it is picked up while the game runs)\n");
+}
+
+DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
+        return ERROR_DEVICE_NOT_CONNECTED;
+
+    if (dwPort == 0)
+        sdlpad_rescan(0);
+
+    if (!sdlpad_get(dwPort, pState)) {
+        if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
+            return ERROR_SUCCESS;
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+    if (dwPort == 0)
+        keyboard_merge(pState);
+    return ERROR_SUCCESS;
+}
+
+DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+{
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    return sdlpad_rumble(dwPort, pVibration) < 0 ? ERROR_DEVICE_NOT_CONNECTED : ERROR_SUCCESS;
+}
+
+BOOL xbox_InputIsConnected(DWORD dwPort)
+{
+    if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
+    return sdlpad_slot_used((int)dwPort) ? TRUE : FALSE;
+}
+
+DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
+{
+    (void)dwFlags;
+    if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    if (!sdlpad_slot_used((int)dwPort))
+        return ERROR_DEVICE_NOT_CONNECTED;
+
+    memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+    pCaps->Type    = 1;   /* XINPUT_DEVTYPE_GAMEPAD */
+    pCaps->SubType = 1;   /* XINPUT_DEVSUBTYPE_GAMEPAD */
+    pCaps->Flags   = 0;
+    return ERROR_SUCCESS;
+}
+
+#else  /* SDL2 */
 #include <SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -358,5 +436,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     pCaps->Flags   = 0;
     return ERROR_SUCCESS;
 }
+
+#endif /* HITZ_SDL3 */
 
 #endif /* _WIN32 */

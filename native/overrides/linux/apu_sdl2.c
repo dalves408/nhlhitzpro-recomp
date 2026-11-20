@@ -26,6 +26,11 @@
 #include <SDL.h>
 #include <time.h>
 
+#ifdef HITZ_SDL3
+#define SDLA_TAG "[SDL3]"
+#else
+#define SDLA_TAG "[SDL2]"
+#endif
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
 /* Device buffer size and count: the same defaults and knobs as the XAudio2
@@ -39,6 +44,16 @@
 #define SDLA_NUM_BUFS_MAX        8
 
 static SDL_AudioDeviceID g_dev;
+#ifdef HITZ_SDL3
+/* SDL3 has no queue API: the same push model is an audio stream bound to the
+ * default playback device. The SDL2-named calls below map onto it. */
+static SDL_AudioStream *g_stream;
+#define SDL_PauseAudioDevice(d, p) ((void)(d), (p) ? SDL_PauseAudioStreamDevice(g_stream) : SDL_ResumeAudioStreamDevice(g_stream))
+#define SDL_ClearQueuedAudio(d)    ((void)(d), SDL_ClearAudioStream(g_stream))
+#define SDL_CloseAudioDevice(d)    ((void)(d), SDL_DestroyAudioStream(g_stream), g_stream = NULL)
+#define SDL_QueueAudio(d, p, n)    ((void)(d), SDL_PutAudioStreamData(g_stream, (p), (int)(n)) ? 0 : -1)
+#define SDL_GetQueuedAudioSize(d)  ((void)(d), (Uint32)SDL_GetAudioStreamQueued(g_stream))
+#endif
 static int       g_buf_samples = SDLA_BUF_SAMPLES_DEFAULT;
 static int       g_num_bufs    = SDLA_NUM_BUFS_DEFAULT;
 static int       g_initialized;
@@ -69,7 +84,12 @@ static int64_t now_ms(void)
 
 int xa2_init(void)
 {
+#ifdef HITZ_SDL3
+    SDL_AudioSpec want;
+    struct { int samples; } have;
+#else
     SDL_AudioSpec want, have;
+#endif
     const char *e, *driver;
 
     if (g_initialized) return 1;
@@ -92,7 +112,7 @@ int xa2_init(void)
 
     if (!SDL_WasInit(SDL_INIT_AUDIO)) {
         if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
-            fprintf(stderr, "[SDL2] audio init failed: %s\n", SDL_GetError());
+            fprintf(stderr, SDLA_TAG " audio init failed: %s\n", SDL_GetError());
             return 0;
         }
         g_audio_opened = 1;
@@ -100,21 +120,36 @@ int xa2_init(void)
 
     memset(&want, 0, sizeof(want));
     want.freq     = SDLA_SAMPLE_RATE;
+#ifdef HITZ_SDL3
+    want.format   = SDL_AUDIO_S16;
+    want.channels = SDLA_CHANNELS;
+    {   char frames[16];
+        snprintf(frames, sizeof frames, "%d", g_buf_samples);
+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, frames);
+    }
+#else
     want.format   = AUDIO_S16SYS;
     want.channels = SDLA_CHANNELS;
     want.samples  = (Uint16)g_buf_samples;
     want.callback = NULL;                       /* push: SDL_QueueAudio */
+#endif
 
     /* No format changes allowed: the mixer's 48 kHz s16 stereo is what the
      * queue takes, and SDL converts for the device if it has to. */
+#ifdef HITZ_SDL3
+    g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, NULL, NULL);
+    g_dev = g_stream ? SDL_GetAudioStreamDevice(g_stream) : 0;
+    have.samples = g_buf_samples;
+#else
     g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+#endif
     if (g_dev == 0) {
-        fprintf(stderr, "[SDL2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+        fprintf(stderr, SDLA_TAG " audio device open failed: %s\n", SDL_GetError());
         if (g_audio_opened) { SDL_QuitSubSystem(SDL_INIT_AUDIO); g_audio_opened = 0; }
         return 0;
     }
     if (have.samples > 0 && have.samples != g_buf_samples) {
-        fprintf(stderr, "[SDL2] device buffer is %d samples (asked %d)\n",
+        fprintf(stderr, SDLA_TAG " device buffer is %d samples (asked %d)\n",
                 have.samples, g_buf_samples);
         g_buf_samples = have.samples;
         /* The queue marks and the pacer's stall window assume buffers no
@@ -131,7 +166,7 @@ int xa2_init(void)
     SDL_PauseAudioDevice(g_dev, 0);
 
     driver = SDL_GetCurrentAudioDriver();
-    fprintf(stderr, "[SDL2] audio initialized: driver %s (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
+    fprintf(stderr, SDLA_TAG " audio initialized: driver %s (%d Hz stereo 16-bit, %d x %d-sample buffers, %.1f ms queued max)%s\n",
             driver ? driver : "?", SDLA_SAMPLE_RATE, g_num_bufs, g_buf_samples,
             1000.0 * g_num_bufs * g_buf_samples / SDLA_SAMPLE_RATE,
             driver && !strcmp(driver, "dummy") ? " [silent: no device output]" : "");
@@ -151,7 +186,7 @@ void xa2_shutdown(void)
         g_audio_opened = 0;
     }
     if (g_initialized)
-        fprintf(stderr, "[SDL2] shut down (%d periods written, %u underruns)\n",
+        fprintf(stderr, SDLA_TAG " shut down (%d periods written, %u underruns)\n",
                 g_frames_written, g_underruns);
     g_initialized = 0;
 }
@@ -180,7 +215,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
     if (SDL_QueueAudio(g_dev, samples,
                        (Uint32)num_samples * SDLA_CHANNELS * sizeof(int16_t)) != 0) {
-        fprintf(stderr, "[SDL2] SDL_QueueAudio failed: %s\n", SDL_GetError());
+        fprintf(stderr, SDLA_TAG " audio queue write failed: %s\n", SDL_GetError());
         return 0;
     }
     g_frames_written++;
@@ -218,7 +253,7 @@ int xa2_queued_samples(void)
             g_underruns++;
             if (now - g_underrun_logged_ms >= 1000) {
                 g_underrun_logged_ms = now;
-                fprintf(stderr, "[SDL2] underrun x%u\n", g_underruns);
+                fprintf(stderr, SDLA_TAG " underrun x%u\n", g_underruns);
             }
         }
     } else {

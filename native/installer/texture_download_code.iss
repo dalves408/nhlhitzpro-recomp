@@ -306,14 +306,15 @@ begin
   if not TexturePackInstalled or TexturePackAlreadyCurrent or TextureCacheChoiceAsked or
      ((TexturePartCaches[1] = '') and (TexturePartCaches[2] = '')) then Exit;
   TextureCacheChoiceAsked := True;
+  { The default is to delete the download once the pack is installed: /KEEPTEXTUREBIN=1 (or Yes below) keeps it. }
   Choice := ExpandConstant('{param:KEEPTEXTUREBIN|}');
-  if Choice = '0' then TextureDeleteCacheOnExit := True
-  else if (Choice = '1') or WizardSilent then TextureDeleteCacheOnExit := False
+  if Choice = '1' then TextureDeleteCacheOnExit := False
+  else if (Choice = '0') or WizardSilent then TextureDeleteCacheOnExit := True
   else
     TextureDeleteCacheOnExit := MsgBox(
-      'Keep the downloaded texture archives for future repairs or reinstalls?' + #13#10#13#10 +
-      'Yes keeps the cached downloads. No deletes them when Setup closes.',
-      mbConfirmation, MB_YESNO) = IDNO;
+      'The hi-res texture pack is installed, so the downloaded archives are no longer needed.' + #13#10#13#10 +
+      'Delete them now? Choose No to keep them for future repairs or reinstalls.',
+      mbConfirmation, MB_YESNO) = IDYES;
   if TextureDeleteCacheOnExit then Log('The user chose to delete the cached texture archives on Setup exit.')
   else Log('The cached texture archives is kept for future repairs or reinstalls.');
 end;
@@ -369,31 +370,15 @@ begin
   Log('Removed the revision 1 texture add-on registration.');
 end;
 
-{ Extraction-only Rev2 has CreateUninstallRegKey=no; write ARP manually so
-  Programs and Features shows DisplayVersion "Revision 2" (not stale "1"). }
+{ The portable game has no entry in Programs and Features: the revision 1 add-on entry and any revision 2 entry
+  an earlier Setup wrote are removed, and none is written. (The pack in the folder is recognised by its manifest.) }
 procedure RegisterTexturePackEntry(AppDir: String);
-var
-  SizeKB: Int64;
 begin
   AppDir := RemoveBackslashUnlessRoot(AppDir);
   if AppDir = '' then Exit;
   RemoveLegacyPackEntry(HKCU, AppDir);
   RemoveLegacyPackEntry(HKLM, AppDir);
-  if not RegWriteStringValue(HKCU, TexturePackKey, 'DisplayName', 'NHL Hitz Pro Hi-Res Textures') then begin
-    Log('Could not register the hi-res texture pack in Programs and Features.');
-    Exit;
-  end;
-  RegWriteStringValue(HKCU, TexturePackKey, 'DisplayVersion', '{#TextureDisplayVersion}');
-  RegWriteStringValue(HKCU, TexturePackKey, 'Publisher', 'dalves408/nhlhitzpro-recomp');
-  RegWriteStringValue(HKCU, TexturePackKey, 'URLInfoAbout', 'https://github.com/dalves408/nhlhitzpro-recomp');
-  RegWriteStringValue(HKCU, TexturePackKey, 'InstallLocation', AddBackslash(AppDir));
-  RegWriteStringValue(HKCU, TexturePackKey, 'Inno Setup: App Path', AppDir);
-  RegWriteDWordValue(HKCU, TexturePackKey, 'NoModify', 1);
-  RegWriteDWordValue(HKCU, TexturePackKey, 'NoRepair', 1);
-  SizeKB := {#TextureExtractedBytes} div 1024;
-  if SizeKB > $FFFFFFFF then SizeKB := $FFFFFFFF;
-  RegWriteDWordValue(HKCU, TexturePackKey, 'EstimatedSize', SizeKB);
-  Log('Registered hi-res textures as {#TextureDisplayVersion} in Programs and Features.');
+  RegDeleteKeyIncludingSubkeys(HKCU, TexturePackKey);
 end;
 
 function TextureKnownPack(AppDir, PackDir: String): Boolean;

@@ -50,8 +50,9 @@ static uint64_t megabytes(const char *key,unsigned fallback,unsigned maximum)
 }
 static void data_root(char *out,size_t size)
 {
-    const char *xdg=getenv("XDG_DATA_HOME"),*home=getenv("HOME");
-    if(xdg&&*xdg)snprintf(out,size,"%s/nhlhitzpro",xdg);
+    const char *xdg=getenv("XDG_DATA_HOME"),*home=getenv("HOME"),*portable=getenv("NHLHITZPRO_DATA");
+    if(portable&&*portable)snprintf(out,size,"%s",portable);   /* the portable data folder (play.sh) */
+    else if(xdg&&*xdg)snprintf(out,size,"%s/nhlhitzpro",xdg);
     else if(home&&*home)snprintf(out,size,"%s/.local/share/nhlhitzpro",home);
     else *out=0;
 }

@@ -4,7 +4,8 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $quiet = [bool]$env:NHL_COLLECT_QUIET   # developer use: no dialogs
 function Say($text, $icon) { if ($quiet) { Write-Output $text } else { [System.Windows.Forms.MessageBox]::Show($text, 'NHL Hitz Pro debug', 'OK', $icon) | Out-Null } }
-$base = Join-Path $env:LOCALAPPDATA 'NHLHitzPro'
+$base = Join-Path $PSScriptRoot 'data'    # the portable data folder, beside this script
+if (-not (Test-Path (Join-Path $base 'debug'))) { $base = Join-Path $env:LOCALAPPDATA 'NHLHitzPro' }   # a debug build that could not use it
 $dbg = Join-Path $base 'debug'
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $stage = Join-Path $env:TEMP "nhl_debug_$stamp"

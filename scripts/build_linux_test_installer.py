@@ -40,9 +40,44 @@ case ${XDG_DATA_HOME:-} in
     /*) ;;
     *) export XDG_DATA_HOME="$HOME/.local/share" ;;
 esac
-DATA="${XDG_DATA_HOME:-$HOME/.local/share}/nhlhitzpro"
-CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/nhlhitzpro"
-mkdir -p "$DATA/logs" "$CACHE"
+# Portable layout: saves, settings, logs and caches live in <install folder>/data. Nothing goes to
+# ~/.local/share or ~/.cache any more.
+DATA="${NHLHITZPRO_DATA:-$GAME_ROOT/data}"
+export NHLHITZPRO_DATA="$DATA"
+CACHE="$DATA/cache"
+mkdir -p "$DATA" "$CACHE"
+# Files that older versions kept in ~/.local/share/nhlhitzpro are moved here once. A file that exists in
+# both places keeps the newer copy; the older copy goes to data/old-folder-backup, nothing is deleted.
+OLD="${XDG_DATA_HOME:-$HOME/.local/share}/nhlhitzpro"
+if [ -d "$OLD" ] && [ "$OLD" != "$DATA" ] && [ ! -e "$DATA/.moved-from-old-folder" ]; then
+    BACKUP="$DATA/old-folder-backup"
+    for item in SaveData settings.ini keymap.ini logs texture_pack; do
+        from="$OLD/$item"; to="$DATA/$item"
+        [ -e "$from" ] || continue
+        if [ -d "$from" ]; then
+            find "$from" -type f | while IFS= read -r f; do
+                rel=${f#"$from"/}
+                if [ ! -e "$to/$rel" ]; then
+                    mkdir -p "$(dirname "$to/$rel")" && mv "$f" "$to/$rel"
+                elif [ "$f" -nt "$to/$rel" ]; then
+                    mkdir -p "$(dirname "$BACKUP/$item/$rel")" && mv "$to/$rel" "$BACKUP/$item/$rel" && mv "$f" "$to/$rel"
+                else
+                    mkdir -p "$(dirname "$BACKUP/$item/$rel")" && mv "$f" "$BACKUP/$item/$rel"
+                fi
+            done
+            find "$from" -depth -type d -empty -delete 2>/dev/null
+        elif [ ! -e "$to" ]; then
+            mv "$from" "$to"
+        elif [ "$from" -nt "$to" ]; then
+            mkdir -p "$BACKUP" && mv "$to" "$BACKUP/$item" && mv "$from" "$to"
+        else
+            mkdir -p "$BACKUP" && mv "$from" "$BACKUP/$item"
+        fi
+    done
+    rmdir "$OLD" 2>/dev/null
+    echo "Moved here from $OLD" > "$DATA/.moved-from-old-folder"
+fi
+mkdir -p "$DATA/logs"
 LOG="$DATA/logs/play.log"
 # keep the last run's log: a second try must not erase the first failure
 if [ -f "$LOG" ]; then mv -f "$LOG" "$DATA/logs/play.previous.log"; fi
@@ -63,6 +98,11 @@ export RECOMP_GL_TEXTURE_WATCH=1 RECOMP_GL_TEXTURE_WATCH_CLEAR_EVERY=8 RECOMP_GL
 export RECOMP_GL_TEXTURE_INDEX=1 RECOMP_PB_IDLE_WAIT_US=100
 export RECOMP_GL_SHADER_PREWARM="$CACHE/hitz_prewarm.txt"
 export RECOMP_TEXPACK="$GAME_ROOT/texture_pack"
+# The Python bundled for Setup and Settings puts its own libraries on LD_LIBRARY_PATH; the game needs none of
+# them, so it gets the caller's original value back.
+if [ -n "${HITZ_ORIG_LD_LIBRARY_PATH+x}" ]; then
+    if [ -n "$HITZ_ORIG_LD_LIBRARY_PATH" ]; then export LD_LIBRARY_PATH="$HITZ_ORIG_LD_LIBRARY_PATH"; else unset LD_LIBRARY_PATH; fi
+fi
 cd "$ROOT/native" || exit 1
 START=$(date +%s)
 ./build-linux/nhl_hitz_pro_recomp "$GAME_ROOT/game_files" "$@" >> "$LOG" 2>&1
@@ -84,8 +124,82 @@ fi
 exit "$STATUS"
 '''
 
-def package_appimage(root, output, version, tool, runtime, project):
+# Libraries that every Linux desktop has (or that must come from the system: glibc, the X server's and the
+# GPU's). Everything else that Setup, Settings or the game load is shipped inside the AppImage.
+SYSTEM_LIBS = re.compile(r'^(linux-vdso|ld-linux|libc|libm|libdl|libpthread|librt|libresolv|libz|libstdc\+\+|libgcc_s|'
+                         r'libX11|libxcb|libXau|libXdmcp|libXext|libXrender|libfontconfig|libfreetype|libexpat|'
+                         r'libpng16|libbz2|libbrotli\w*|libbsd|libmd|libssl|libcrypto|libGL\w*|libEGL)\.')
+
+PYTHON_WRAPPER = '''#!/bin/sh
+# Bundled Python 3 with Tk for Setup and Settings, so the system needs neither.
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+if [ -z "${HITZ_ORIG_LD_LIBRARY_PATH+x}" ]; then
+  HITZ_ORIG_LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}
+  export HITZ_ORIG_LD_LIBRARY_PATH
+fi
+LD_LIBRARY_PATH="$here/lib${HITZ_ORIG_LD_LIBRARY_PATH:+:$HITZ_ORIG_LD_LIBRARY_PATH}"
+PYTHONHOME=$here PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+TCL_LIBRARY=$here/tcltk/tcl8.6 TK_LIBRARY=$here/tcltk/tk8.6
+export LD_LIBRARY_PATH PYTHONHOME PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE TCL_LIBRARY TK_LIBRARY
+exec "$here/bin/python3.12" -s "$@"
+'''
+
+
+def shared_deps(path):
+    """name -> resolved path for each library `path` loads that is not a system one."""
+    out = subprocess.check_output(['ldd', str(path)], text=True)
+    deps = {}
+    for name, target in re.findall(r'^\s*(\S+) => (/\S+)', out, re.M):
+        if not SYSTEM_LIBS.match(name):
+            deps[name] = Path(target).resolve()
+    missing = re.findall(r'^\s*(\S+) => not found', out, re.M)
+    if missing:
+        raise SystemExit(f'{path}: missing {missing}')
+    return deps
+
+
+def bundle_python(root):
+    """Python 3.12 (the build machine's), its standard library and Tcl/Tk, under root/python."""
+    py = root / 'python'
+    stdlib = Path('/usr/lib/python3.12')
+    shutil.copytree(stdlib, py / 'lib/python3.12', symlinks=False, ignore=shutil.ignore_patterns(
+        '__pycache__', 'test', 'tests', 'idlelib', 'turtledemo', 'ensurepip', 'lib2to3', 'pydoc_data',
+        'config-3.12-*', 'dist-packages', 'site-packages', 'EXTERNALLY-MANAGED'))
+    (py / 'bin').mkdir(parents=True)
+    shutil.copy2(Path('/usr/bin/python3.12').resolve(), py / 'bin/python3.12')
+    wrapper = py / 'bin/python3'
+    wrapper.write_text(PYTHON_WRAPPER)
+    wrapper.chmod(0o755)
+    libs = {}
+    for module in (py / 'lib/python3.12/lib-dynload').glob('_tkinter*.so'):
+        libs.update(shared_deps(module))
+    for path in list(libs.values()):
+        libs.update(shared_deps(path))
+    if not any(name.startswith('libtk8') for name in libs):
+        raise SystemExit('Tk not found: install python3-tk on the build machine')
+    (py / 'lib').mkdir(exist_ok=True)
+    for name, path in libs.items():
+        shutil.copy2(path, py / 'lib' / name)
+    shutil.copytree('/usr/share/tcltk', py / 'tcltk', symlinks=False)
+    for license_file in ('/usr/share/doc/python3.12/copyright', '/usr/share/doc/tcl8.6/copyright', '/usr/share/doc/tk8.6/copyright'):
+        if Path(license_file).is_file():
+            (root / 'player/LICENSES').mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(license_file, root / 'player/LICENSES' / (Path(license_file).parent.name + '-copyright.txt'))
+    return sorted(libs)
+
+
+def package_appimage(root, output, version, tool, runtime, project, args):
+    """The AppImage carries everything it needs: its own Python with Tk, 7-Zip and the libraries the player loads.
+    The only files released are the AppImage and the RecompLauncher tar.gz."""
     shutil.copyfile(project / 'native/installer/linux/appimage.py', root / 'appimage.py')
+    # Python 3 with Tk 8.6 (the build machine's, which draws text through fontconfig) and 7-Zip travel inside: nothing
+    # from the system but the graphics driver.
+    bundle_python(root)
+    (root / 'bin').mkdir()
+    if not args.sevenzip or not args.sevenzip.is_file():
+        raise SystemExit('pass --sevenzip (the 7zz binary)')
+    shutil.copy2(args.sevenzip, root / 'bin/7zz')
+    (root / 'bin/7zz').chmod(0o755)
     app_run = root / 'AppRun'
     app_run.write_text('''#!/bin/sh
 set -eu
@@ -94,7 +208,9 @@ if [ -n "${APPIMAGE:-}" ]; then
   HITZ_SETUP_DIR=$(dirname -- "$APPIMAGE")
   export HITZ_SETUP_DIR
 fi
-exec python3 "$root/appimage.py" "$@"
+export PATH="$root/python/bin:$root/bin:$PATH"
+export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+exec "$root/python/bin/python3" "$root/appimage.py" "$@"
 ''')
     app_run.chmod(0o755)
     (root / 'nhl-hitz-pro.desktop').write_text(
@@ -102,27 +218,26 @@ exec python3 "$root/appimage.py" "$@"
         'Comment=Play NHL Hitz Pro\nExec=AppRun\nIcon=nhl-hitz-pro\n'
         'Terminal=false\nCategories=Game;SportsGame;\n')
     shutil.copyfile(root / 'icon.png', root / 'nhl-hitz-pro.png')
-    # The Linux-x64 SDK archive should win the launcher's asset selection.
+    # RecompLauncher finds the manifest at the root of the AppImage.
+    manifest_text = json.dumps(manifest('linux'), indent=2) + '\n'
+    (root / 'recomplauncher.json').write_text(manifest_text)
+    (root / 'THIRD-PARTY.txt').write_text(
+        'Bundled in this AppImage:\n'
+        '- Python 3.12 with Tcl/Tk 8.6 (Ubuntu): Python Software Foundation License; Tcl/Tk license.\n'
+        '- 7-Zip 23.01 (7zz): GNU LGPL with the unRAR restriction; Igor Pavlov.\n'
+        '- SDL3: zlib license.  libepoxy: MIT.  libpng: libpng license.  OpenSSL (libcrypto): Apache 2.0.\n'
+        'Their license texts are in LICENSES/ and python/ and the project repository.\n')
     artifact = output / f'NHLHitzPro-{version}-Standalone.AppImage'
     subprocess.run([str(tool), '--runtime-file', str(runtime), '--no-appstream', str(root), str(artifact)],
                    env=dict(os.environ, ARCH='x86_64', APPIMAGE_EXTRACT_AND_RUN='1'), check=True)
-    sdk_manifest = output / 'recomplauncher.json'
-    sdk_manifest.write_text(json.dumps(manifest('linux'), indent=2) + '\n')
-    prepare = output / 'prepare-game.sh'
-    prepare.write_text('''#!/bin/sh
-set -eu
-root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export APPIMAGE_EXTRACT_AND_RUN=1
-exec "$root/NHLHitzPro.AppImage" --prepare --game "$1"
-''')
-    prepare.chmod(0o755)
+    # The Linux-x64 archive is the RecompLauncher asset: the AppImage and the manifest, nothing else.
     archive = output / f'NHLHitzPro-{version}-Linux-x64.tar.gz'
-    with tarfile.open(archive, 'w:gz') as tar:
-        tar.add(artifact, arcname='NHLHitzPro.AppImage')
-        tar.add(sdk_manifest, arcname=sdk_manifest.name)
-        tar.add(prepare, arcname=prepare.name)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    (output / (archive.name + '.sha256')).write_text(f'{digest}  {archive.name}\n')
+    with tempfile.TemporaryDirectory() as temp:
+        sdk_manifest = Path(temp) / 'recomplauncher.json'
+        sdk_manifest.write_text(manifest_text)
+        with tarfile.open(archive, 'w:gz') as tar:
+            tar.add(artifact, arcname='NHLHitzPro.AppImage')
+            tar.add(sdk_manifest, arcname='recomplauncher.json')
     return artifact
 
 
@@ -132,6 +247,9 @@ def main():
     ap.add_argument('--project', type=Path, required=True)
     ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--version', default='1.0.9-linux')
+    ap.add_argument('--sdl3-lib', type=Path, help='libSDL3.so.0 to ship beside the player (required when the player is built on SDL3)')
+    ap.add_argument('--sevenzip', type=Path, help='the 7zz binary to bundle')
+    ap.add_argument('--bundle-lib', type=Path, action='append', default=[], help='a system library the player loads, copied beside it (repeat)')
     ap.add_argument('--appimagetool', type=Path)
     ap.add_argument('--appimage-runtime', type=Path)
     args = ap.parse_args()
@@ -219,7 +337,17 @@ else: gui(b)
         binary.parent.mkdir(parents=True)
         shutil.copy2(source / 'native/build-linux/nhl_hitz_pro_recomp', binary)
         subprocess.run(['strip', '--strip-debug', str(binary)], check=True)
+        needed = subprocess.check_output(['readelf', '-d', str(binary)], text=True)
+        if 'libSDL3.so' in needed:
+            if not args.sdl3_lib or not args.sdl3_lib.is_file():
+                raise SystemExit('the player is built on SDL3: pass --sdl3-lib path/to/libSDL3.so.0')
+            shutil.copy2(args.sdl3_lib, binary.parent / 'libSDL3.so.0')
+            metadata['sdl3_sha256'] = hashlib.sha256(args.sdl3_lib.read_bytes()).hexdigest()
+        elif 'libSDL2' in needed:
+            metadata['sdl2'] = 'system library'
         binary.chmod(0o755)
+        for lib in args.bundle_lib:
+            shutil.copyfile(lib.resolve(), binary.parent / lib.name)
         metadata['player_sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
         versions = re.findall(r'GLIBC_(\d+)\.(\d+)', subprocess.check_output(['readelf', '--version-info', str(binary)], text=True))
         metadata['elf_glibc_required'] = '.'.join(map(str, max(tuple(map(int, value)) for value in versions)))
@@ -234,13 +362,12 @@ else: gui(b)
         shutil.copyfile(project / 'linux/nhl_config.py', player / 'nhl_config.py')
         shutil.copyfile(icon, player / 'icon.png')
         shutil.copyfile(icon, binary.parent / 'icon.png')  # window icon beside ELF
-        shutil.copyfile(project / 'native/installer/linux/uninstall.py', player / 'uninstall.py')
         shutil.copyfile(project / 'native/installer/linux/menu_shortcuts.py', player / 'menu_shortcuts.py')
         (player / 'install-shortcuts.py').write_text('#!/usr/bin/env python3\nfrom menu_shortcuts import main\nmain()\n')
         (player / 'play.sh').write_text(PLAY)
         (player / 'version.txt').write_text(version + '\n')
         (player / 'settings.sh').write_text('#!/bin/sh\nROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexec python3 "$ROOT/nhl_config.py"\n')
-        for name in ('play.sh', 'settings.sh', 'uninstall.py', 'install-shortcuts.py'):
+        for name in ('play.sh', 'settings.sh', 'install-shortcuts.py'):
             (player / name).chmod(0o755)
         for base, name in [(source, 'LICENSE'), (source / 'tools/xboxrecomp', 'LICENSE')]:
             if (base / name).is_file():
@@ -251,6 +378,10 @@ else: gui(b)
             shutil.copyfile(toolkit / 'NOTICE', player / 'NOTICE-toolkit.txt')
         if (toolkit / 'LICENSES').is_dir():
             shutil.copytree(toolkit / 'LICENSES', player / 'LICENSES')
+        sdl3_license = project / 'native/third_party/SDL3-3.4.20/LICENSE.txt'
+        if (binary.parent / 'libSDL3.so.0').is_file() and sdl3_license.is_file():
+            (player / 'LICENSES').mkdir(exist_ok=True)
+            shutil.copyfile(sdl3_license, player / 'LICENSES' / 'SDL3-LICENSE.txt')
         if (source / 'native/third_party/xxhash.h').is_file():
             licenses = player / 'LICENSES'
             licenses.mkdir(exist_ok=True)
@@ -265,19 +396,23 @@ texture_pack/ folder beside the AppImage to avoid downloading. Otherwise Setup
 downloads both parts from the textures-2 GitHub release (7-Zip required to extract).
 
 Run play.sh to play, settings.sh to configure. F1 opens in-game settings.
-Requires x86-64 Linux, glibc 2.39+, SDL2, libepoxy, libpng16, and an OpenGL 3.3 driver.
+Requires x86-64 Linux, glibc 2.39+, libepoxy, libpng16, and an OpenGL 3.3 driver. SDL3 is included.
+Controllers: Xbox, PlayStation, Switch and most other pads work (SDL3). If Steam is running with Steam Input
+on, it can take the pad away from the game: turn Steam Input off for that controller, or close Steam.
 Hi-res DDS formats may require additional GPU capabilities.
-Debian 13 / Ubuntu 24.04+: sudo apt install libsdl2-2.0-0 libepoxy0 libpng16-16t64 python3-tk 7zip innoextract
-Fedora 41+: sudo dnf install SDL2 libepoxy libpng python3-tkinter 7zip innoextract
-Settings/saves: $XDG_DATA_HOME/nhlhitzpro or ~/.local/share/nhlhitzpro.
-Play log: logs/play.log in that folder (the previous run is kept as play.previous.log).
+Debian 13 / Ubuntu 24.04+: sudo apt install libepoxy0 libpng16-16t64 python3-tk 7zip innoextract
+Fedora 41+: sudo dnf install libepoxy libpng python3-tkinter 7zip innoextract
+Portable: everything the game writes (saves, settings, keymap, logs, caches, the download cache) is in the
+"data" folder inside the install folder. Copy or delete the install folder as one piece. Files that
+older versions kept in ~/.local/share/nhlhitzpro are moved there on the first start (the newer copy of a
+file wins; an older duplicate goes to data/old-folder-backup).
+Play log: data/logs/play.log (the previous run is kept as play.previous.log).
 If the game stops or does not start, run play.sh from a terminal: it prints the log path and the
-last lines of the log. Attach play.log when reporting a problem. Shader prewarm: ~/.cache/nhlhitzpro.
+last lines of the log. Attach play.log when reporting a problem. Shader prewarm: data/cache.
 Default fresh settings: 1x, fullscreen, 4:3, 60 FPS, enhancements off.
 Enable hi-res in settings.sh or F1 with render scale 2x or greater.
-python3 uninstall.py removes unchanged program files/shortcuts, keeping game data,
-textures, saves, settings and modified files. Remove the game directory manually
-if you also want to discard imported game data and installed textures.
+There is no uninstaller: delete the install folder to remove the game. If you made menu entries, delete the
+two NHL Hitz Pro .desktop files in ~/.local/share/applications as well.
 Setup can update or repair an existing installation in place.
 Menu repair (no reinstall): python3 install-shortcuts.py
 Run Setup and menu repair as your normal desktop user, without sudo.
@@ -291,7 +426,7 @@ Run Setup and menu repair as your normal desktop user, without sudo.
                 'Use --setup to repair or update the standalone installation.\n'
                 'RecompLauncher users use the .tar.gz release asset.'))
             artifact = package_appimage(root, output, version, args.appimagetool.resolve(),
-                                        args.appimage_runtime.resolve(), project)
+                                        args.appimage_runtime.resolve(), project, args)
         else:
             artifact = output / f'NHLHitzPro-Setup-{version}-x86_64.run'
             with artifact.open('wb') as target:
@@ -300,12 +435,10 @@ Run Setup and menu repair as your normal desktop user, without sudo.
                     for path in sorted(root.iterdir()):
                         tar.add(path, arcname=path.name)
         sha = hashlib.sha256(artifact.read_bytes()).hexdigest()
-        (output / (artifact.name + '.sha256')).write_text(f'{sha}  {artifact.name}\n')
-        metadata.update(installer_sha256=sha, installer_bytes=artifact.stat().st_size)
-        (output / 'build-info.json').write_text(json.dumps(metadata, indent=2))
-        shutil.copyfile(player / 'README-LINUX.txt', output / 'README-LINUX.txt')
-        shutil.copyfile(project / 'native/installer/linux/menu_shortcuts.py', output / 'NHLHitzPro-Repair-Menu.py')
         print(artifact, artifact.stat().st_size, sha)
+        archive = next(output.glob('*-Linux-x64.tar.gz'), None)
+        if archive:
+            print(archive, archive.stat().st_size, hashlib.sha256(archive.read_bytes()).hexdigest())
 
 if __name__ == '__main__':
     main()

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NHL Hitz Pro - Settings (Linux port of native/config/config.c).
 Reads and writes the same settings.ini the Linux game uses:
-$XDG_DATA_HOME/nhlhitzpro/settings.ini (default ~/.local/share/nhlhitzpro/settings.ini),
+<install folder>/data/settings.ini (NHLHITZPRO_DATA; older versions used ~/.local/share/nhlhitzpro),
 sections [display] and [textures], and keymap.ini beside it ([keys], Windows virtual-key codes,
 the same file config.exe writes; overrides/keyboard.c reads it). play.sh leaves these to the game,
 which reads them at start-up."""
@@ -9,6 +9,10 @@ import os, configparser, tkinter as tk
 from tkinter import ttk
 
 def ini_path(name="settings.ini"):
+    # the portable data folder (<install folder>/data) when the launcher set it, else the old place
+    portable = os.environ.get("NHLHITZPRO_DATA")
+    if portable:
+        return os.path.join(portable, name)
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
     return os.path.join(base, "nhlhitzpro", name)
 
