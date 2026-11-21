@@ -1,0 +1,3 @@
+[
+  {"start": "0x001BBCE0", "observed": true, "note": "Hockey School drill start: the game calls this method through a pointer (22 failed [ICALL] in a run). The detector had merged it into the switch function at 0x001BBC70, whose jump tables and 0xCC padding precede it."}
+]

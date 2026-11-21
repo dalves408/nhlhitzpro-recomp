@@ -3885,12 +3885,13 @@ static void be_flip(void)
     pad_unblock_tick();
     pad_open_poll();
     while (s_q_active) { Sleep(8); pump_messages(); quit_tick(); pad_overlay_poll(); }
-    if (g.log && (g.flips % 300) == 0)
+    if (g.log && (g.flips % 300) == 0) {
         logf_("flips=%u t=%.1fs rcdraws=%u specs=%u specfail=%u spec_ms=%llu draws=%u tris=%u textures=%d decodes=%llu uploads=%llu decode_ms=%llu hash_ms=%llu\n",
               g.flips, (GetTickCount() - g.t0) / 1000.0, g.rc_draws, s_nspec, s_spec_fail, (unsigned long long)s_spec_ms, g.draws, g.tris, s_ntex,
               (unsigned long long)s_dec_n, (unsigned long long)s_up_n,
               (unsigned long long)(s_dec_us / 1000), (unsigned long long)(s_hash_us / 1000));
         logf_("pack_hits rink=%u logos=%u jerseys=%u glow=%u other=%u (hires=%d)\n", s_pack_hits[0], s_pack_hits[1], s_pack_hits[2], s_pack_hits[3], s_pack_hits[4], s_hires);
+    }
     if (g.log && s_gstate > 0 && (g.flips % 300) == 0)
         logf_("gpuvs: draws=%lu verts=%lu MB=%lu programs=%u failed=%u compile_ms=%u mapfail=%lu\n",
               s_gdraws, s_gverts, s_gbytes >> 20, s_ngspec, s_gspec_fail, s_gspec_ms, s_gmapfail);

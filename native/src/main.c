@@ -102,6 +102,90 @@ static char s_user_data[MAX_PATH];     /* <install folder>\data\SaveData */
 extern void nhl_debug_init(void);      /* debug_report.c */
 #endif
 
+#ifndef NHL_DEBUGLOG
+/* ---- Play log (release flavour) -------------------------------------------------------------- */
+static LONG CALLBACK release_unhandled(PEXCEPTION_POINTERS ep)
+{
+    fprintf(stderr, "[CRASH] Unhandled exception 0x%08lX at 0x%llX\n",
+            ep->ExceptionRecord->ExceptionCode, (unsigned long long)(uintptr_t)ep->ExceptionRecord->ExceptionAddress);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void release_atexit(void)
+{
+    fprintf(stderr, "[EXIT] The game process ended normally.\n");
+    fflush(stderr);
+}
+
+static void release_log_open(void)
+{
+    char base[MAX_PATH], dir[MAX_PATH], cur[MAX_PATH], prev[MAX_PATH], ver[64] = "";
+    char exe[MAX_PATH];
+    SYSTEMTIME st;
+    MEMORYSTATUSEX ms;
+    FILE *f;
+    typedef LONG (WINAPI *rtl_ver_fn)(OSVERSIONINFOW *);
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    rtl_ver_fn rv = nt ? (rtl_ver_fn)(void *)GetProcAddress(nt, "RtlGetVersion") : NULL;
+    OSVERSIONINFOW os;
+    char cpu[128] = "";
+    DWORD cpun = sizeof cpu;
+    HKEY k;
+
+    if (!nhl_data_dir(base, sizeof base))
+        return;
+    snprintf(dir, sizeof dir, "%s\\logs", base);
+    nhl_dd_mkdirs(dir);
+    snprintf(cur, sizeof cur, "%s\\play.log", dir);
+    snprintf(prev, sizeof prev, "%s\\play.previous.log", dir);
+    MoveFileExA(cur, prev, MOVEFILE_REPLACE_EXISTING);
+    if (!freopen(cur, "w", stderr))
+        return;
+    freopen(cur, "a", stdout);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    {   /* version.txt is written beside the exe by Setup */
+        char vp[MAX_PATH];
+        char *sl;
+        strcpy(vp, exe);
+        sl = strrchr(vp, '\\');
+        if (sl) { strcpy(sl + 1, "version.txt"); f = fopen(vp, "r"); if (f) { if (fgets(ver, sizeof ver, f)) ver[strcspn(ver, "\r\n")] = 0; fclose(f); } }
+    }
+    GetLocalTime(&st);
+    fprintf(stderr, "NHL Hitz Pro play log\n");
+    fprintf(stderr, "Version: %s\n", ver[0] ? ver : "(unknown)");
+    fprintf(stderr, "Started: %04d-%02d-%02d %02d:%02d:%02d\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    memset(&os, 0, sizeof os); os.dwOSVersionInfoSize = sizeof os;
+    if (rv && rv(&os) == 0)
+        fprintf(stderr, "Windows: %lu.%lu build %lu\n", os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &k) == 0) {
+        RegQueryValueExA(k, "ProcessorNameString", NULL, NULL, (LPBYTE)cpu, &cpun);
+        RegCloseKey(k);
+    }
+    fprintf(stderr, "CPU: %s\n", cpu);
+    memset(&ms, 0, sizeof ms); ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms))
+        fprintf(stderr, "RAM: %llu MB\n", (unsigned long long)(ms.ullTotalPhys >> 20));
+    fprintf(stderr, "Exe: %s\nData: %s\n", exe, base);
+    {   /* settings.ini, so a report shows the player's options */
+        char sp[MAX_PATH], line[256];
+        snprintf(sp, sizeof sp, "%s\\settings.ini", base);
+        f = fopen(sp, "r");
+        if (f) {
+            fprintf(stderr, "--- settings.ini ---\n");
+            while (fgets(line, sizeof line, f)) fputs(line, stderr);
+            fprintf(stderr, "\n--------------------\n");
+            fclose(f);
+        }
+    }
+    atexit(release_atexit);
+    SetUnhandledExceptionFilter(release_unhandled);
+}
+#endif
+
 static void release_init(void)
 {
     char exe[MAX_PATH], base[MAX_PATH], cache[MAX_PATH], *sl, *env, *p;
@@ -120,9 +204,8 @@ static void release_init(void)
     if (!getenv("RECOMP_KEYLOG")) _putenv_s("RECOMP_KEYLOG", "1");
     if (!getenv("RECOMP_APU_TRACE")) _putenv_s("RECOMP_APU_TRACE", "1");
 #else
-    /* No console output or log lines of any kind. */
-    freopen("NUL", "w", stdout);
-    freopen("NUL", "w", stderr);
+    /* Play log for support: <data>\logs\play.log (the run before it is kept as play.previous.log). */
+    release_log_open();
     /* The RECOMP_* diagnostic and tuning switches are a developer interface:
      * drop whatever the environment carries and let the defaults below apply. */
     env = GetEnvironmentStringsA();

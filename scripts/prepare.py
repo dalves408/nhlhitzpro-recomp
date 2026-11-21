@@ -15,7 +15,7 @@ I = OUT / 'identified'
 A = OUT / 'abi'
 STEPS = [
     ('parse', ['tools.xbe_parser', XBE, '--json', str(ROOT / 'game_files/default_analysis.json')]),
-    ('disasm', ['tools.disasm', XBE, '--text-only', '--extra-sections', EXTRA, '--output', str(D), '--verbose']),
+    ('disasm', ['tools.disasm', XBE, '--text-only', '--extra-sections', EXTRA, '--seed-functions', str(ROOT / 'scripts/seed_functions.json'), '--output', str(D), '--verbose']),
     ('identify', ['tools.func_id', XBE, '--functions', str(D / 'functions.json'), '--strings', str(D / 'strings.json'), '--xrefs', str(D / 'xrefs.json'), '--output', str(I)]),
     ('abi', ['tools.abi_analysis', XBE, '--disasm-dir', str(D), '--func-id-dir', str(I), '--output-dir', str(A), '-v']),
     ('recompile', ['tools.recomp', XBE, '--all', '--split', '250', '--game-name', 'NHL Hitz Pro', '--disasm-dir', str(D), '--func-id-dir', str(I), '--abi-dir', str(A), '--gen-dir', str(ROOT / 'native/src/recomp/gen'), '--output-dir', str(OUT / 'recomp')]),
